@@ -18,6 +18,14 @@ target_link_libraries(testcloudpinyin
 add_dependencies(testcloudpinyin cloudpinyin copy-addon-cloudpinyin)
 endif()
 
+if (ENABLE_CHINESE_LLM)
+add_executable(testllmbackend testllmbackend.cpp ../modules/chinese-llm/llmbackend.cpp)
+target_include_directories(testllmbackend PRIVATE ${PROJECT_SOURCE_DIR}/modules/chinese-llm)
+target_link_libraries(testllmbackend Fcitx5::Core nlohmann_json::nlohmann_json)
+add_test(NAME testllmbackend COMMAND testllmbackend)
+
+endif()
+
 add_executable(testpinyinhelper testpinyinhelper.cpp)
 target_link_libraries(testpinyinhelper Fcitx5::Core Fcitx5::Module::PinyinHelper)
 add_dependencies(testpinyinhelper pinyin pinyin.conf.in-fmt pinyinhelper pinyinhelper.conf.in-fmt)
