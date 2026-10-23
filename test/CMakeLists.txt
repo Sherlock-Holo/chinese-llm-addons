@@ -24,6 +24,12 @@ target_include_directories(testllmbackend PRIVATE ${PROJECT_SOURCE_DIR}/modules/
 target_link_libraries(testllmbackend Fcitx5::Core nlohmann_json::nlohmann_json)
 add_test(NAME testllmbackend COMMAND testllmbackend)
 
+# Not registered with add_test: this one needs a mock HTTP server on a known
+# port, so it is driven by scripts/smoke.sh instead of ctest.
+add_executable(testllmworker testllmworker.cpp ../modules/chinese-llm/llmbackend.cpp ../modules/chinese-llm/llmworker.cpp)
+target_include_directories(testllmworker PRIVATE ${PROJECT_SOURCE_DIR}/modules/chinese-llm)
+target_link_libraries(testllmworker Fcitx5::Core nlohmann_json::nlohmann_json PkgConfig::Curl Pthread::Pthread)
+
 endif()
 
 add_executable(testpinyinhelper testpinyinhelper.cpp)
