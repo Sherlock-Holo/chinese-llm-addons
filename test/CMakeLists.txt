@@ -30,6 +30,10 @@ add_executable(testllmworker testllmworker.cpp ../modules/chinese-llm/llmbackend
 target_include_directories(testllmworker PRIVATE ${PROJECT_SOURCE_DIR}/modules/chinese-llm)
 target_link_libraries(testllmworker Fcitx5::Core nlohmann_json::nlohmann_json PkgConfig::Curl Pthread::Pthread)
 
+# Also driven by scripts/smoke.sh: it needs a running fcitx5 instance plus the
+# mock server.
+add_executable(testllmaddon testllmaddon.cpp)
+target_link_libraries(testllmaddon Fcitx5::Core Fcitx5::Config Fcitx5::Module::TestFrontend)
 endif()
 
 add_executable(testpinyinhelper testpinyinhelper.cpp)

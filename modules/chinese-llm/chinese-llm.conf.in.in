@@ -1,0 +1,16 @@
+[Addon]
+Name=Chinese LLM
+Comment=LLM powered pinyin candidates via an OpenAI compatible endpoint
+Category=Module
+Version=@PROJECT_VERSION@
+Library=libchinese-llm
+Type=@FCITX_ADDON_TYPE@
+OnDemand=False
+Configurable=True
+Enabled=False
+
+[Addon/Dependencies]
+0=core:@REQUIRED_FCITX_VERSION@
+
+[Addon/OptionalDependencies]
+0=pinyin

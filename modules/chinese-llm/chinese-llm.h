@@ -1,0 +1,203 @@
+/*
+ * SPDX-FileCopyrightText: 2026-2026
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+#ifndef _CHINESE_LLM_CHINESE_LLM_H_
+#define _CHINESE_LLM_CHINESE_LLM_H_
+
+#include "llmbackend.h"
+#include "llmworker.h"
+#include <chrono>
+#include <cstdint>
+#include <fcitx-config/configuration.h>
+#include <fcitx-config/iniparser.h>
+#include <fcitx-config/option.h>
+#include <fcitx-utils/event.h>
+#include <fcitx-utils/eventdispatcher.h>
+#include <fcitx-utils/eventloopinterface.h>
+#include <fcitx-utils/i18n.h>
+#include <fcitx-utils/key.h>
+#include <fcitx-utils/misc.h>
+#include <fcitx-utils/trackableobject.h>
+#include <fcitx/addonfactory.h>
+#include <fcitx/addoninstance.h>
+#include <fcitx/addonmanager.h>
+#include <fcitx/inputcontextproperty.h>
+#include <fcitx/instance.h>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace fcitx::chinesellm {
+
+FCITX_CONFIGURATION(
+    ChineseLlmConfig,
+    fcitx::Option<bool> enabled{this, "Enabled", _("Enable LLM candidates"),
+                                true};
+    fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation> endpoint{
+        this,
+        "Endpoint",
+        _("Endpoint"),
+        "http://127.0.0.1:11434/v1/chat/completions",
+        {},
+        {},
+        {_("An OpenAI compatible chat completions URL. Works with ollama, "
+           "llama.cpp's llama-server, and hosted compatible APIs.")}};
+    fcitx::Option<std::string> model{this, "Model", _("Model"), "qwen3:0.6b"};
+    fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation> apiKey{
+        this,
+        "ApiKey",
+        _("API Key"),
+        "",
+        {},
+        {},
+        {_("Sent as a bearer token. Leave empty for a local server that does "
+           "not authenticate. Falls back to the environment variable "
+           "FCITX_CHINESE_LLM_API_KEY when empty.")}};
+    fcitx::Option<int, fcitx::IntConstrain> minPinyinLength{
+        this, "MinPinyinLength", _("Minimum Pinyin Length"), 4,
+        fcitx::IntConstrain(1, 40)};
+    fcitx::Option<int, fcitx::IntConstrain> debounceMs{
+        this, "DebounceMs", _("Debounce Delay (ms)"), 250,
+        fcitx::IntConstrain(0, 2000)};
+    fcitx::Option<int, fcitx::IntConstrain> timeoutSeconds{
+        this, "TimeoutSeconds", _("Request Timeout (seconds)"), 5,
+        fcitx::IntConstrain(1, 30)};
+    fcitx::Option<int, fcitx::IntConstrain> maxCandidates{
+        this, "MaxCandidates", _("Max Candidates"), 3, fcitx::IntConstrain(1, 5)};
+    fcitx::Option<int, fcitx::IntConstrain> candidateIndex{
+        this, "CandidateIndex", _("Candidate Position"), 2,
+        fcitx::IntConstrain(1, 10)};
+    fcitx::Option<int, fcitx::IntConstrain> contextLength{
+        this, "ContextLength", _("Context Length (characters)"), 64,
+        fcitx::IntConstrain(0, 256)};
+    fcitx::Option<int, fcitx::IntConstrain> cacheSize{
+        this, "CacheSize", _("Cache Size"), 256,
+        fcitx::IntConstrain(0, 4096)};
+    fcitx::Option<int, fcitx::IntConstrain> maxConsecutiveErrors{
+        this, "MaxConsecutiveErrors", _("Errors Before Cooldown"), 5,
+        fcitx::IntConstrain(1, 50)};
+    fcitx::Option<int, fcitx::IntConstrain> cooldownSeconds{
+        this, "CooldownSeconds", _("Cooldown (seconds)"), 120,
+        fcitx::IntConstrain(10, 3600)};
+    fcitx::Option<bool> showBadge{this, "ShowBadge", _("Mark LLM candidates"),
+                                  true};
+    fcitx::Option<bool> skipShuangpin{
+        this, "SkipShuangpin",
+        _("Skip shuangpin (the model expects full pinyin)"), true};
+    fcitx::Option<fcitx::KeyList> toggleKey{this, "ToggleKey",
+                                            _("Toggle Key"),
+                                            {fcitx::Key("Control+Alt+Shift+L")}};
+    fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation>
+        systemPrompt{
+            this,
+            "SystemPrompt",
+            _("System Prompt"),
+            "You are a Chinese pinyin input method. Convert the pinyin keys "
+            "into the most likely Chinese sentence, using the context to "
+            "disambiguate. Output only the Chinese characters on a single "
+            "line. No pinyin, no explanation, no quotes.",
+            {},
+            {},
+            {_("Keep this short and unambiguous. The model must answer with "
+               "Han characters only, otherwise its output is discarded.")}};
+    fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation>
+        promptTemplate{this,
+                       "PromptTemplate",
+                       _("Prompt Template"),
+                       "{context}\n{pinyin}",
+                       {},
+                       {},
+                       {_("{context} is replaced with the recently committed "
+                          "text, {pinyin} with the keys being typed.")}};);
+
+/// Per input context state. The candidate list is rebuilt from scratch on
+/// every keystroke, so everything that must survive a rebuild lives here.
+struct LlmState : public fcitx::InputContextProperty {
+    /// Pinyin of the most recent request issued for this context.
+    std::string pinyin;
+    /// Pending debounce timer, reset on every keystroke.
+    std::unique_ptr<fcitx::EventSourceTime> debounce;
+    /// Guards against re-entering our own UI update. Inserting a candidate and
+    /// refreshing the panel emits InputContextUpdateUI again; without this flag
+    /// that would recurse forever.
+    bool inserting = false;
+    /// Bumped whenever the pinyin changes, so a reply for an older pinyin can
+    /// be recognised as stale even after the state is updated.
+    uint64_t generation = 0;
+};
+
+class ChineseLlm : public fcitx::AddonInstance,
+                   public fcitx::TrackableObject<ChineseLlm> {
+public:
+    ChineseLlm(fcitx::AddonManager *manager);
+    ~ChineseLlm() override;
+
+    void reloadConfig() override;
+    const fcitx::Configuration *getConfig() const override { return &config_; }
+    void setConfig(const fcitx::RawConfig &config) override;
+    void save() override;
+
+    /// Exposed for tests.
+    LlmState *stateFor(fcitx::InputContext *ic) { return ic->propertyFor(&factory_); }
+
+private:
+    void handleUpdateUI(fcitx::Event &event);
+    void handleKeyEvent(fcitx::Event &event);
+
+    /// Whether this input context is one we should generate candidates for.
+    /// Not const: an expired cooldown is cleared as a side effect of asking.
+    bool isEligible(fcitx::InputContext *ic);
+    /// Recently committed text before the cursor, at most ContextLength chars.
+    std::string buildContext(fcitx::InputContext *ic) const;
+    /// Schedule a request for the given pinyin after the debounce delay.
+    void scheduleRequest(fcitx::InputContext *ic, LlmState *state,
+                         std::string pinyin, std::string context);
+    /// Actually hand the request to the worker.
+    void dispatchRequest(fcitx::InputContext *ic, LlmState *state,
+                         std::string pinyin, std::string context,
+                         uint64_t generation);
+    /// Insert the given candidates at the configured position.
+    void insertCandidates(fcitx::InputContext *ic, LlmState *state,
+                          const std::vector<std::string> &candidates);
+    void toggle();
+
+    void noteError(const std::string &error);
+    bool inCooldown() const;
+    /// Clear the cooldown state once it has expired.
+    void expireCooldown();
+    void rememberCandidates(const std::string &pinyin,
+                            const std::vector<std::string> &candidates);
+
+    BackendConfig backendConfig() const;
+
+    std::unique_ptr<LlmWorker> worker_;
+    fcitx::Instance *instance_;
+    fcitx::EventDispatcher &dispatcher_;
+    fcitx::FactoryFor<LlmState> factory_{
+        [](fcitx::InputContext &) { return new LlmState; }};
+    ChineseLlmConfig config_;
+    std::vector<std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>>
+        eventWatchers_;
+
+    /// Cached candidates by pinyin. A hit skips the round trip entirely, which
+    /// matters most when the user retypes the same word.
+    std::unordered_map<std::string, std::vector<std::string>> cache_;
+    std::vector<std::string> cacheOrder_;
+
+    int errorCount_ = 0;
+    std::chrono::steady_clock::time_point cooldownUntil_{};
+};
+
+class ChineseLlmFactory : public fcitx::AddonFactory {
+public:
+    fcitx::AddonInstance *create(fcitx::AddonManager *manager) override {
+        return new ChineseLlm(manager);
+    }
+};
+
+} // namespace fcitx::chinesellm
+
+#endif // _CHINESE_LLM_CHINESE_LLM_H_
