@@ -51,8 +51,14 @@ RequestSpec buildRequest(const BackendConfig &config, std::string_view pinyin,
 /// Extract choices[0].message.content from a chat completions reply.
 ///
 /// Returns an empty string on any parse failure, when content is missing or is
-/// not a string, or when the reply carries no usable text.
+/// not a string, or when the reply is explicitly incomplete (e.g. token limit).
 std::string parseResponse(std::string_view body);
+
+/// Parse a complete response, distinguishing malformed replies from valid empty
+/// content. Clears content and returns false on failure. Missing/null
+/// finish_reason is tolerated for local OpenAI-compatible servers; an explicit
+/// finish_reason must be "stop".
+bool parseResponse(std::string_view body, std::string &content);
 
 /// Turn raw model output into candidates that are safe to commit.
 ///

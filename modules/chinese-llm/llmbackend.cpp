@@ -4,21 +4,18 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 #include "llmbackend.h"
-#include <algorithm>
-#include <array>
 #include <cstdint>
 #include <fcitx-utils/utf8.h>
+#include <iterator>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <unordered_set>
-#include <utility>
 
 namespace fcitx::chinesellm {
 
 namespace {
 
-bool isSpace(char c) {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
-}
+bool isSpace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
 
 std::string_view trim(std::string_view s) {
     while (!s.empty() && isSpace(s.front())) {
@@ -68,24 +65,18 @@ std::string_view stripTrailingPunct(std::string_view line) {
         if (line.empty()) {
             return line;
         }
-        // Find the final code point. These strings are a handful of characters,
-        // so the linear walk is irrelevant against a request round trip.
-        uint32_t chr = utf8::INVALID_CHAR;
-        auto iter = line.begin();
-        while (iter != line.end()) {
-            iter = utf8::getNextChar(iter, line.end(), &chr);
-        }
-        if (!isTrailingPunct(chr)) {
-            return line;
-        }
-        // Rewind over the UTF-8 continuation bytes of that code point.
-        auto begin = line.end();
+        // Decode only the final code point, rather than rescanning the entire
+        // prefix for every punctuation mark. Even a response-sized suffix is
+        // stripped in linear time. Invalid UTF-8 is left for validation below.
+        auto begin = std::prev(line.end());
         while (begin != line.begin() &&
-               (static_cast<unsigned char>(*std::prev(begin)) & 0xC0) == 0x80) {
-            begin--;
+               (static_cast<unsigned char>(*begin) & 0xC0) == 0x80) {
+            --begin;
         }
-        if (begin != line.begin()) {
-            begin--;
+        uint32_t chr = utf8::INVALID_CHAR;
+        const auto end = utf8::getNextChar(begin, line.end(), &chr);
+        if (end != line.end() || !isTrailingPunct(chr)) {
+            return line;
         }
         line.remove_suffix(static_cast<size_t>(line.end() - begin));
     }
@@ -95,11 +86,13 @@ std::string_view stripNoise(std::string_view line) {
     line = trim(line);
     // Leading and trailing ASCII wrappers. Only one byte is ever removed, which
     // is correct because these are ASCII.
-    while (!line.empty() && kNoise.find(line.front()) != std::string_view::npos) {
+    while (!line.empty() &&
+           kNoise.find(line.front()) != std::string_view::npos) {
         line.remove_prefix(1);
         line = trim(line);
     }
-    while (!line.empty() && kNoise.find(line.back()) != std::string_view::npos) {
+    while (!line.empty() &&
+           kNoise.find(line.back()) != std::string_view::npos) {
         line.remove_suffix(1);
         line = trim(line);
     }
@@ -131,6 +124,25 @@ bool isAllowedCjkPunct(uint32_t c) {
     default:
         return false;
     }
+}
+
+/// Validate candidate text and count only Han, not tolerated punctuation.
+std::optional<size_t> countHan(std::string_view text) {
+    size_t count = 0;
+    auto iter = text.begin();
+    while (iter != text.end()) {
+        uint32_t chr = utf8::INVALID_CHAR;
+        iter = utf8::getNextChar(iter, text.end(), &chr);
+        if (chr == utf8::INVALID_CHAR || chr == utf8::NOT_ENOUGH_SPACE) {
+            return std::nullopt;
+        }
+        if (isHanCodePoint(chr)) {
+            ++count;
+        } else if (!isAllowedCjkPunct(chr)) {
+            return std::nullopt;
+        }
+    }
+    return count;
 }
 
 std::vector<std::string_view> splitPinyin(std::string_view pinyin) {
@@ -196,9 +208,16 @@ RequestSpec buildRequest(const BackendConfig &config, std::string_view pinyin,
 }
 
 std::string parseResponse(std::string_view body) {
+    std::string content;
+    parseResponse(body, content);
+    return content;
+}
+
+bool parseResponse(std::string_view body, std::string &content) {
+    content.clear();
     body = trim(body);
     if (body.empty()) {
-        return {};
+        return false;
     }
     // Trim to the outermost braces so that a fenced block or trailing newline
     // still parses.
@@ -206,7 +225,7 @@ std::string parseResponse(std::string_view body) {
     const auto last = body.rfind('}');
     if (first == std::string_view::npos || last == std::string_view::npos ||
         last < first) {
-        return {};
+        return false;
     }
     body = body.substr(first, last - first + 1);
 
@@ -214,15 +233,26 @@ std::string parseResponse(std::string_view body) {
         const auto jv = nlohmann::json::parse(body);
         const auto &choices = jv.at("choices");
         if (!choices.is_array() || choices.empty()) {
-            return {};
+            return false;
         }
-        const auto &content = choices.at(0).at("message").at("content");
-        if (!content.is_string()) {
-            return {};
+        const auto &choice = choices.at(0);
+        const auto finish = choice.find("finish_reason");
+        // A token-limited answer can still be valid JSON containing plausible
+        // Han text, but it is not safe to commit. Other explicit non-stop
+        // reasons (e.g. content_filter/tool_calls) are not completed text
+        // either.
+        if (finish != choice.end() && !finish->is_null() &&
+            (!finish->is_string() || finish->get<std::string>() != "stop")) {
+            return false;
         }
-        return content.get<std::string>();
+        const auto &value = choice.at("message").at("content");
+        if (!value.is_string()) {
+            return false;
+        }
+        content = value.get<std::string>();
+        return true;
     } catch (const std::exception &) {
-        return {};
+        return false;
     }
 }
 
@@ -240,26 +270,9 @@ size_t countSyllables(std::string_view pinyin) {
 }
 
 bool isAllHan(std::string_view text) {
-    if (text.empty()) {
-        return false;
-    }
-    auto iter = text.begin();
-    const auto end = text.end();
-    bool sawHan = false;
-    while (iter != end) {
-        uint32_t chr = utf8::INVALID_CHAR;
-        iter = utf8::getNextChar(iter, end, &chr);
-        if (chr == utf8::INVALID_CHAR || chr == utf8::NOT_ENOUGH_SPACE) {
-            return false;
-        }
-        if (isHanCodePoint(chr)) {
-            sawHan = true;
-        } else if (!isAllowedCjkPunct(chr)) {
-            return false;
-        }
-    }
+    const auto count = countHan(text);
     // Punctuation alone is not an answer.
-    return sawHan;
+    return count && *count != 0;
 }
 
 bool isPlainPinyin(std::string_view text) {
@@ -283,6 +296,7 @@ std::vector<std::string> sanitize(std::string_view content,
                                   std::string_view pinyin,
                                   size_t maxCandidates) {
     std::vector<std::string> result;
+    std::unordered_set<std::string> seen;
     const size_t expectedLength = countSyllables(pinyin);
 
     // Models routinely ignore "single line" and emit several readings. Take
@@ -293,10 +307,9 @@ std::vector<std::string> sanitize(std::string_view content,
             break;
         }
         const auto eol = content.find('\n', pos);
-        const auto raw =
-            content.substr(pos, eol == std::string_view::npos
-                                    ? std::string_view::npos
-                                    : eol - pos);
+        const auto raw = content.substr(pos, eol == std::string_view::npos
+                                                 ? std::string_view::npos
+                                                 : eol - pos);
         pos = eol == std::string_view::npos ? content.size() + 1 : eol + 1;
 
         auto line = stripNoise(raw);
@@ -306,26 +319,25 @@ std::vector<std::string> sanitize(std::string_view content,
         // Reject anything that is not Han text: this catches the model
         // answering in English, echoing the pinyin back, or emitting digits,
         // any of which would be committed verbatim if we let it through.
-        if (!isAllHan(line)) {
+        const auto hanCount = countHan(line);
+        if (!hanCount || *hanCount == 0) {
             continue;
         }
-        // When the syllable count is known, the character count must match
+        // When the syllable count is known, the Han count must match
         // exactly. The pinyin engine checks this itself only to decide whether
         // to *learn* the word (pinyin.cpp:263 in fcitx5-chinese-addons); the
         // commit path is unconditional, so an extra character here would land
         // in the user's document carrying a silently wrong reading.
-        if (expectedLength != 0 && utf8::length(line) != expectedLength) {
+        if (expectedLength != 0 && *hanCount != expectedLength) {
             continue;
         }
-        result.emplace_back(line);
+        // Deduplicate before applying the limit, preserving the model's order.
+        // A repeated answer must not crowd out another valid candidate.
+        auto [entry, inserted] = seen.emplace(line);
+        if (inserted) {
+            result.push_back(*entry);
+        }
     }
-
-    // Deduplicate while preserving order; the model sometimes repeats itself
-    // across lines and duplicate candidates look like a UI bug.
-    std::unordered_set<std::string> seen;
-    std::erase_if(result, [&seen](const std::string &candidate) {
-        return !seen.insert(candidate).second;
-    });
     return result;
 }
 

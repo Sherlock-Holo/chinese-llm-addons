@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 #include "llmbackend.h"
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -132,8 +133,9 @@ void testParseResponse() {
             "parseResponse reads content");
 
     // A fenced block with surrounding whitespace still parses.
-    const std::string fenced =
-        "  \n```json\n{\"choices\":[{\"message\":{\"content\":\"你好\"}}]}\n```\n ";
+    const std::string fenced = "  "
+                               "\n```json\n{\"choices\":[{\"message\":{"
+                               "\"content\":\"你好\"}}]}\n```\n ";
     checkEq(parseResponse(fenced), std::string("你好"),
             "parseResponse tolerates a fenced block");
 
@@ -156,6 +158,33 @@ void testParseResponse() {
             std::string(""), "parseResponse rejects non-string content");
     checkEq(parseResponse(R"({"error":{"message":"boom"}})"), std::string(""),
             "parseResponse rejects an error reply");
+    checkEq(
+        parseResponse(
+            R"({"choices":[{"message":{"content":"你好"},"finish_reason":"length"}]})"),
+        std::string(""), "parseResponse rejects token-limited Han text");
+    checkEq(
+        parseResponse(
+            R"({"choices":[{"message":{"content":"你好"},"finish_reason":"content_filter"}]})"),
+        std::string(""), "parseResponse rejects content-filtered text");
+    checkEq(
+        parseResponse(
+            R"({"choices":[{"message":{"content":"你好"},"finish_reason":42}]})"),
+        std::string(""), "parseResponse rejects malformed finish_reason");
+    checkEq(
+        parseResponse(
+            R"({"choices":[{"message":{"content":"你好"},"finish_reason":null}]})"),
+        std::string("你好"), "parseResponse tolerates null finish_reason");
+
+    std::string content = "stale";
+    check(
+        parseResponse(
+            R"({"choices":[{"message":{"content":""},"finish_reason":"stop"}]})",
+            content) &&
+            content.empty(),
+        "parseResponse distinguishes valid empty content from failure");
+    content = "stale";
+    check(!parseResponse("not json", content) && content.empty(),
+          "parseResponse clears content on parse failure");
 }
 
 void testCountSyllables() {
@@ -184,6 +213,11 @@ void testIsAllHan() {
     check(!isAllHan("你好abc"), "isAllHan rejects mixed ASCII");
     check(!isAllHan("你好123"), "isAllHan rejects digits");
     check(!isAllHan("，"), "isAllHan rejects punctuation only");
+    check(isAllHan("𠀀你好"), "isAllHan accepts supplementary-plane Han");
+    check(!isAllHan(std::string("你好") + '\x80'),
+          "isAllHan rejects a stray continuation byte");
+    check(!isAllHan(std::string("你好") + '\xe3'),
+          "isAllHan rejects a truncated UTF-8 code point");
 }
 
 void testIsPlainPinyin() {
@@ -225,6 +259,29 @@ void testSanitize() {
     // Duplicates are a UI bug in waiting.
     checkCandidates(sanitize("你好\n你好", "ni'hao", 3), {"你好"},
                     "sanitize deduplicates");
+    checkCandidates(sanitize("你好\n你好\n拟好", "ni'hao", 2), {"你好", "拟好"},
+                    "sanitize counts unique candidates toward the limit");
+    checkCandidates(sanitize("阿·勒泰", "a'le'tai", 3), {"阿·勒泰"},
+                    "sanitize counts Han rather than internal punctuation");
+    checkCandidates(sanitize("你·好", "ni'hao'ma", 3), {},
+                    "sanitize does not count punctuation as a missing Han");
+    checkCandidates(sanitize("𠀀好", "ni'hao", 3), {"𠀀好"},
+                    "sanitize counts supplementary-plane Han as one syllable");
+    checkCandidates(sanitize(std::string("你好") + '\x80', "ni'hao", 3), {},
+                    "sanitize does not strip invalid UTF-8 into valid text");
+    checkCandidates(sanitize("你好。 ，！? \t", "ni'hao", 3), {"你好"},
+                    "sanitize strips mixed trailing punctuation and spaces");
+
+    std::string noisy = "你好";
+    while (noisy.size() + std::string_view("。 ").size() <=
+           MAX_RESPONSE_BYTES) {
+        noisy += "。 ";
+    }
+    const auto started = std::chrono::steady_clock::now();
+    checkCandidates(sanitize(noisy, "ni'hao", 3), {"你好"},
+                    "sanitize handles a response-sized punctuation suffix");
+    check(std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+          "sanitize strips long punctuation in linear time");
 
     // A length mismatch means the model invented or dropped a character; the
     // commit path is unconditional, so this must never be shown.
