@@ -16,10 +16,6 @@ namespace fcitx::chinesellm {
 
 namespace {
 
-// The log category is defined in chinese-llm.cpp; declaring it here avoids a
-// duplicate definition while keeping the same category name in the log.
-FCITX_DECLARE_LOG_CATEGORY(chinesellm);
-
 struct WriteSink {
     std::string data;
     bool overflow = false;
@@ -42,7 +38,15 @@ LlmWorker::LlmWorker() {
         // leak the Authorization header to another host.
         (curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L) == CURLE_OK) &&
         (curl_easy_setopt(curl_, CURLOPT_MAXREDIRS, 3L) == CURLE_OK) &&
-        (curl_easy_setopt(curl_, CURLOPT_UNRESTRICTED_AUTH, 0L) == CURLE_OK);
+        // Chat completions remain POSTs on 301/302/303; curl otherwise changes
+        // these into GETs and silently drops the JSON request body.
+        (curl_easy_setopt(curl_, CURLOPT_POSTREDIR,
+                          static_cast<long>(CURL_REDIR_POST_ALL)) ==
+         CURLE_OK) &&
+        (curl_easy_setopt(curl_, CURLOPT_UNRESTRICTED_AUTH, 0L) == CURLE_OK) &&
+        (curl_easy_setopt(curl_, CURLOPT_NOPROGRESS, 0L) == CURLE_OK) &&
+        (curl_easy_setopt(curl_, CURLOPT_XFERINFOFUNCTION,
+                          &LlmWorker::progressCallback) == CURLE_OK);
     if (!ok) {
         curl_easy_cleanup(curl_);
         curl_ = nullptr;
@@ -70,6 +74,7 @@ void LlmWorker::stop() {
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         stop_.store(true, std::memory_order_relaxed);
+        seq_.fetch_add(1, std::memory_order_relaxed);
         pending_.reset();
     }
     cv_.notify_all();
@@ -80,9 +85,13 @@ void LlmWorker::stop() {
 
 uint64_t LlmWorker::submit(BackendConfig config, std::string pinyin,
                            std::string context, FetchCallback callback) {
-    const uint64_t seq = seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint64_t seq;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
+        // Assign the sequence under the same lock as pending_, so cancellation
+        // and concurrent submissions cannot replace a newer job with an old
+        // one.
+        seq = seq_.fetch_add(1, std::memory_order_relaxed) + 1;
         // Replacing rather than queuing is the whole point: only the newest
         // pinyin is worth asking about, and this is where the per-keystroke
         // fan-out is collapsed into a single request.
@@ -97,17 +106,16 @@ uint64_t LlmWorker::submit(BackendConfig config, std::string pinyin,
 }
 
 void LlmWorker::cancelAll() {
-    // Bumping the sequence is enough to make every in-flight reply stale; the
-    // request itself will run to completion and be discarded.
+    // Bumping the sequence makes replies stale and the progress callback aborts
+    // an in-flight transfer, freeing the single worker for the next request.
+    const std::lock_guard<std::mutex> lock(mutex_);
     seq_.fetch_add(1, std::memory_order_relaxed);
-    {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        pending_.reset();
-    }
+    pending_.reset();
 }
 
 bool LlmWorker::isCurrent(uint64_t seq) const {
-    return seq == seq_.load(std::memory_order_relaxed);
+    return !stop_.load(std::memory_order_relaxed) &&
+           seq == seq_.load(std::memory_order_relaxed);
 }
 
 void LlmWorker::run() {
@@ -115,7 +123,8 @@ void LlmWorker::run() {
         std::optional<Job> job;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] { return stop_.load() || pending_.has_value(); });
+            cv_.wait(lock,
+                     [this] { return stop_.load() || pending_.has_value(); });
             if (stop_.load()) {
                 return;
             }
@@ -126,51 +135,76 @@ void LlmWorker::run() {
             continue;
         }
 
-        std::string body;
-        std::string error;
-        const bool ok = perform(*job, body, error);
+        FetchResult result;
+        result.seq = job->seq;
+        result.pinyin = job->pinyin;
+        try {
+            std::string body;
+            result.ok = perform(*job, body, result.error);
+            if (result.ok && isCurrent(job->seq)) {
+                std::string content;
+                if (parseResponse(body, content)) {
+                    result.candidates = sanitize(content, result.pinyin, 0);
+                } else {
+                    result.ok = false;
+                    result.error = "invalid completion response";
+                }
+            }
+        } catch (const std::exception &e) {
+            // Invalid UTF-8 in configuration can make JSON serialization throw.
+            // Report request processing failures, never terminate the worker
+            // (and thus the entire input method). Callback exceptions remain
+            // the caller's responsibility and are deliberately not caught here.
+            result.ok = false;
+            result.candidates.clear();
+            result.error =
+                std::string("request processing failed: ") + e.what();
+        }
         if (!isCurrent(job->seq)) {
             FCITX_DEBUG() << "chinese-llm: discarding superseded reply for "
-                          << job->pinyin;
+                          << result.pinyin;
             continue;
         }
-
-        FetchResult result;
-        result.ok = ok;
-        result.pinyin = job->pinyin;
-        result.error = std::move(error);
-        if (ok) {
-            result.candidates =
-                sanitize(parseResponse(body), job->pinyin, 0);
-        }
-        if (job->callback) {
+        // Parsing/sanitizing may take time. Check again immediately before
+        // delivery; the main-thread consumer must also validate result.seq,
+        // since a request can be superseded after this check or while queued.
+        if (job->callback && isCurrent(job->seq)) {
             job->callback(std::move(result));
         }
     }
 }
 
 bool LlmWorker::perform(const Job &job, std::string &body, std::string &error) {
+    if (!isCurrent(job.seq)) {
+        error = "cancelled";
+        return false;
+    }
     const auto spec = buildRequest(job.config, job.pinyin, job.context);
 
     curl_slist *headers = nullptr;
     for (const auto &header : spec.headers) {
-        headers = curl_slist_append(headers, header.c_str());
+        auto *appended = curl_slist_append(headers, header.c_str());
+        if (!appended) {
+            curl_slist_free_all(headers);
+            error = "failed to allocate request headers";
+            return false;
+        }
+        headers = appended;
     }
 
     WriteSink sink;
+    TransferState transfer{this, job.seq};
     // The timeout must be per request: a shorter budget is deliberately used
     // here than cloudpinyin's hardcoded 10s because a slow reply is useless
     // once the user has typed past it.
-    const long timeout =
-        std::clamp<long>(job.config.timeoutSeconds > 0
-                             ? job.config.timeoutSeconds
-                             : 5,
-                         1, 60);
+    const long timeout = std::clamp<long>(
+        job.config.timeoutSeconds > 0 ? job.config.timeoutSeconds : 5, 1, 60);
     const long connectTimeout = std::min<long>(timeout, 3);
 
     bool ok = false;
     do {
-        if (curl_easy_setopt(curl_, CURLOPT_URL, spec.url.c_str()) != CURLE_OK) {
+        if (curl_easy_setopt(curl_, CURLOPT_URL, spec.url.c_str()) !=
+            CURLE_OK) {
             error = "invalid url";
             break;
         }
@@ -191,14 +225,21 @@ bool LlmWorker::perform(const Job &job, std::string &body, std::string &error) {
             error = "invalid post body";
             break;
         }
-        if (curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &sink) != CURLE_OK) {
-            error = "invalid write sink";
+        if (curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &sink) != CURLE_OK ||
+            curl_easy_setopt(curl_, CURLOPT_XFERINFODATA, &transfer) !=
+                CURLE_OK) {
+            error = "invalid transfer callbacks";
+            break;
+        }
+        if (!isCurrent(job.seq)) {
+            error = "cancelled";
             break;
         }
 
         const auto code = curl_easy_perform(curl_);
         if (code != CURLE_OK) {
-            error = curl_easy_strerror(code);
+            error =
+                sink.overflow ? "response too large" : curl_easy_strerror(code);
             break;
         }
         long httpCode = 0;
@@ -220,8 +261,16 @@ bool LlmWorker::perform(const Job &job, std::string &body, std::string &error) {
     curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, nullptr);
     curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, 0L);
     curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, nullptr);
+    curl_easy_setopt(curl_, CURLOPT_WRITEDATA, nullptr);
+    curl_easy_setopt(curl_, CURLOPT_XFERINFODATA, nullptr);
     curl_slist_free_all(headers);
     return ok;
+}
+
+int LlmWorker::progressCallback(void *userdata, curl_off_t, curl_off_t,
+                                curl_off_t, curl_off_t) {
+    const auto *transfer = static_cast<const TransferState *>(userdata);
+    return transfer && transfer->worker->isCurrent(transfer->seq) ? 0 : 1;
 }
 
 size_t LlmWorker::writeCallback(char *ptr, size_t size, size_t nmemb,

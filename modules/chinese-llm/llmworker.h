@@ -21,10 +21,12 @@
 
 namespace fcitx::chinesellm {
 
-/// Result of one request, delivered on the main thread.
+/// Result of one request. The callback runs on the worker thread; the caller
+/// must marshal it to the main thread and revalidate seq before using it.
 struct FetchResult {
-    /// True when the request produced a usable HTTP response. A false value
-    /// still carries the sequence number so a superseded request can be
+    uint64_t seq = 0;
+    /// True when the request produced a valid, complete chat response. A false
+    /// value still carries the sequence number so a superseded request can be
     /// discarded without being counted as an error.
     bool ok = false;
     std::string pinyin;
@@ -62,7 +64,7 @@ public:
     /// changes or the addon is toggled, so stale replies cannot land.
     void cancelAll();
 
-    /// Sequence number of the newest submitted request.
+    /// Latest sequence, including invalidation by cancelAll() or stop().
     uint64_t currentSeq() const { return seq_.load(std::memory_order_relaxed); }
 
 private:
@@ -81,6 +83,12 @@ private:
 
     static size_t writeCallback(char *ptr, size_t size, size_t nmemb,
                                 void *userdata);
+    struct TransferState {
+        const LlmWorker *worker;
+        uint64_t seq;
+    };
+    static int progressCallback(void *userdata, curl_off_t, curl_off_t,
+                                curl_off_t, curl_off_t);
 
     std::thread thread_;
     std::atomic<bool> stop_{false};
