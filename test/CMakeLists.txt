@@ -1,6 +1,9 @@
 configure_file(testdir.h.in ${CMAKE_CURRENT_BINARY_DIR}/testdir.h @ONLY)
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
+add_subdirectory(addon)
+
+if (NOT ENABLE_CHINESE_LLM_ONLY)
 add_executable(testpunctuation testpunctuation.cpp)
 target_link_libraries(testpunctuation Fcitx5::Core Fcitx5::Module::Punctuation)
 add_dependencies(testpunctuation punctuation punctuation.conf.in-fmt)
@@ -17,6 +20,7 @@ target_link_libraries(testcloudpinyin
     Fcitx5::Core Fcitx5::Config Fcitx5::Module::CloudPinyin)
 add_dependencies(testcloudpinyin cloudpinyin copy-addon-cloudpinyin)
 endif()
+endif()
 
 if (ENABLE_CHINESE_LLM)
 add_executable(testllmbackend testllmbackend.cpp ../modules/chinese-llm/llmbackend.cpp)
@@ -24,16 +28,44 @@ target_include_directories(testllmbackend PRIVATE ${PROJECT_SOURCE_DIR}/modules/
 target_link_libraries(testllmbackend Fcitx5::Core nlohmann_json::nlohmann_json)
 add_test(NAME testllmbackend COMMAND testllmbackend)
 
+add_executable(testllmconfig testllmconfig.cpp)
+target_include_directories(testllmconfig PRIVATE ${PROJECT_SOURCE_DIR}/modules/chinese-llm)
+target_link_libraries(testllmconfig Fcitx5::Core Fcitx5::Config PkgConfig::Curl nlohmann_json::nlohmann_json)
+add_test(NAME testllmconfig COMMAND testllmconfig)
+
 # Not registered with add_test: this one needs a mock HTTP server on a known
 # port, so it is driven by scripts/smoke.sh instead of ctest.
 add_executable(testllmworker testllmworker.cpp ../modules/chinese-llm/llmbackend.cpp ../modules/chinese-llm/llmworker.cpp)
 target_include_directories(testllmworker PRIVATE ${PROJECT_SOURCE_DIR}/modules/chinese-llm)
 target_link_libraries(testllmworker Fcitx5::Core nlohmann_json::nlohmann_json PkgConfig::Curl Pthread::Pthread)
 
-# Also driven by scripts/smoke.sh: it needs a running fcitx5 instance plus the
-# mock server.
+# Also driven by scripts/smoke.sh: it creates its own fcitx5 Instance and
+# loads the installed pinyin/testfrontend addons plus the build-tree LLM addon.
 add_executable(testllmaddon testllmaddon.cpp)
-target_link_libraries(testllmaddon Fcitx5::Core Fcitx5::Config Fcitx5::Module::TestFrontend)
+target_include_directories(testllmaddon PRIVATE ${PROJECT_SOURCE_DIR}/modules/chinese-llm)
+target_link_libraries(testllmaddon Fcitx5::Core Fcitx5::Config Fcitx5::Module::TestFrontend PkgConfig::Curl nlohmann_json::nlohmann_json)
+add_dependencies(testllmaddon chinese-llm copy-addon-chinese-llm)
+
+# The module CMake package exposes headers, not the runtime module location.
+# Record discovery for smoke.sh; the cache variable allows nonstandard layouts.
+get_filename_component(_fcitx_library_dir "${Fcitx5Core_DIR}/../.." ABSOLUTE)
+find_path(FCITX5_TEST_ADDON_DIR NAMES libtestfrontend.so libtestfrontend.dylib
+    HINTS "${_fcitx_library_dir}/fcitx5"
+          "${FCITX_SYS_INSTALL_PREFIX}/lib/${CMAKE_LIBRARY_ARCHITECTURE}/fcitx5"
+          "${FCITX_SYS_INSTALL_PREFIX}/lib/fcitx5"
+          "${FCITX_SYS_INSTALL_PREFIX}/lib64/fcitx5"
+    DOC "Directory containing the runtime testfrontend addon")
+if (FCITX5_TEST_ADDON_DIR)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/runtime-addon-dir.txt" "${FCITX5_TEST_ADDON_DIR}\n")
+else()
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/runtime-addon-dir.txt" "\n")
+    message(WARNING "testfrontend runtime library not found; set FCITX5_TEST_ADDON_DIR before running smoke.sh")
+endif()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/runtime-data-dir.txt" "${FCITX_SYS_INSTALL_PREFIX}/share/fcitx5\n")
+endif()
+
+if (ENABLE_CHINESE_LLM_ONLY)
+    return()
 endif()
 
 add_executable(testpinyinhelper testpinyinhelper.cpp)
@@ -52,7 +84,6 @@ target_link_libraries(testchttrans Fcitx5::Core Fcitx5::Module::TestFrontend Fci
 add_dependencies(testchttrans chttrans chttrans.conf.in-fmt copy-addon copy-testim)
 add_test(NAME testchttrans COMMAND testchttrans)
 
-add_subdirectory(addon)
 add_executable(testpinyin testpinyin.cpp)
 target_link_libraries(testpinyin Fcitx5::Core Fcitx5::Module::TestFrontend)
 add_dependencies(testpinyin pinyin pinyinhelper copy-addon copy-im)

@@ -66,7 +66,8 @@ FCITX_CONFIGURATION(
         this, "TimeoutSeconds", _("Request Timeout (seconds)"), 5,
         fcitx::IntConstrain(1, 30)};
     fcitx::Option<int, fcitx::IntConstrain> maxCandidates{
-        this, "MaxCandidates", _("Max Candidates"), 3, fcitx::IntConstrain(1, 5)};
+        this, "MaxCandidates", _("Max Candidates"), 3,
+        fcitx::IntConstrain(1, 5)};
     fcitx::Option<int, fcitx::IntConstrain> candidateIndex{
         this, "CandidateIndex", _("Candidate Position"), 2,
         fcitx::IntConstrain(1, 10)};
@@ -74,8 +75,7 @@ FCITX_CONFIGURATION(
         this, "ContextLength", _("Context Length (characters)"), 64,
         fcitx::IntConstrain(0, 256)};
     fcitx::Option<int, fcitx::IntConstrain> cacheSize{
-        this, "CacheSize", _("Cache Size"), 256,
-        fcitx::IntConstrain(0, 4096)};
+        this, "CacheSize", _("Cache Size"), 256, fcitx::IntConstrain(0, 4096)};
     fcitx::Option<int, fcitx::IntConstrain> maxConsecutiveErrors{
         this, "MaxConsecutiveErrors", _("Errors Before Cooldown"), 5,
         fcitx::IntConstrain(1, 50)};
@@ -87,9 +87,11 @@ FCITX_CONFIGURATION(
     fcitx::Option<bool> skipShuangpin{
         this, "SkipShuangpin",
         _("Skip shuangpin (the model expects full pinyin)"), true};
-    fcitx::Option<fcitx::KeyList> toggleKey{this, "ToggleKey",
-                                            _("Toggle Key"),
-                                            {fcitx::Key("Control+Alt+Shift+L")}};
+    fcitx::Option<fcitx::KeyList> toggleKey{
+        this,
+        "ToggleKey",
+        _("Toggle Key"),
+        {fcitx::Key("Control+Alt+Shift+L")}};
     fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation>
         systemPrompt{
             this,
@@ -116,8 +118,11 @@ FCITX_CONFIGURATION(
 /// Per input context state. The candidate list is rebuilt from scratch on
 /// every keystroke, so everything that must survive a rebuild lives here.
 struct LlmState : public fcitx::InputContextProperty {
-    /// Pinyin of the most recent request issued for this context.
+    /// Composition and context associated with the current request/results.
     std::string pinyin;
+    std::string context;
+    std::vector<std::string> candidates;
+    uint64_t requestSeq = 0;
     /// Pending debounce timer, reset on every keystroke.
     std::unique_ptr<fcitx::EventSourceTime> debounce;
     /// Guards against re-entering our own UI update. Inserting a candidate and
@@ -141,11 +146,19 @@ public:
     void save() override;
 
     /// Exposed for tests.
-    LlmState *stateFor(fcitx::InputContext *ic) { return ic->propertyFor(&factory_); }
+    LlmState *stateFor(fcitx::InputContext *ic) {
+        return ic->propertyFor(&factory_);
+    }
 
 private:
     void handleUpdateUI(fcitx::Event &event);
     void handleKeyEvent(fcitx::Event &event);
+    void invalidateState(fcitx::InputContext *ic, LlmState *state);
+    void invalidateAll();
+    void removeCandidates(fcitx::InputContext *ic, LlmState *state);
+    std::string currentPinyin(fcitx::InputContext *ic) const;
+    static std::string cacheKey(const std::string &pinyin,
+                                const std::string &context);
 
     /// Whether this input context is one we should generate candidates for.
     /// Not const: an expired cooldown is cleared as a side effect of asking.
@@ -168,7 +181,7 @@ private:
     bool inCooldown() const;
     /// Clear the cooldown state once it has expired.
     void expireCooldown();
-    void rememberCandidates(const std::string &pinyin,
+    void rememberCandidates(const std::string &key,
                             const std::vector<std::string> &candidates);
 
     BackendConfig backendConfig() const;
@@ -182,8 +195,8 @@ private:
     std::vector<std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>>
         eventWatchers_;
 
-    /// Cached candidates by pinyin. A hit skips the round trip entirely, which
-    /// matters most when the user retypes the same word.
+    /// LRU cache keyed by pinyin and preceding text. Configuration changes
+    /// clear it so results from different models/prompts never mix.
     std::unordered_map<std::string, std::vector<std::string>> cache_;
     std::vector<std::string> cacheOrder_;
 

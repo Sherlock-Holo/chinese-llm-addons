@@ -18,6 +18,7 @@
 #include <fcitx/inputpanel.h>
 #include <fcitx/text.h>
 #include <fcitx/userinterface.h>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,12 +42,15 @@ constexpr char kBadge[] = "LLM";
  * Selecting it commits the text, clears the input panel, and resets the input
  * context. The reset is what makes the pinyin engine drop its composition:
  * Instance watches InputContextReset in the InputMethod phase and calls
- * PinyinEngine::reset(), which clears the buffer and rebuilds the panel. Without
- * it the engine would keep the half-typed pinyin after our text went out.
+ * PinyinEngine::reset(), which clears the buffer and rebuilds the panel.
+ * Without it the engine would keep the half-typed pinyin after our text went
+ * out.
  */
 class LlmCandidateWord : public fcitx::CandidateWord {
 public:
-    LlmCandidateWord(std::string text, bool badge) : text_(std::move(text)) {
+    LlmCandidateWord(std::string text, bool badge,
+                     std::function<bool(fcitx::InputContext *)> valid)
+        : text_(std::move(text)), valid_(std::move(valid)) {
         setText(fcitx::Text(text_));
         if (badge) {
             fcitx::Text comment(kBadge);
@@ -55,6 +59,9 @@ public:
     }
 
     void select(fcitx::InputContext *inputContext) const override {
+        if (!valid_(inputContext)) {
+            return;
+        }
         inputContext->commitString(text_);
         inputContext->inputPanel().reset();
         inputContext->reset();
@@ -62,13 +69,13 @@ public:
 
 private:
     std::string text_;
+    std::function<bool(fcitx::InputContext *)> valid_;
 };
 
 } // namespace
 
 ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
-    : worker_(std::make_unique<LlmWorker>()),
-      instance_(manager->instance()),
+    : worker_(std::make_unique<LlmWorker>()), instance_(manager->instance()),
       dispatcher_(manager->instance()->eventDispatcher()) {
     instance_->inputContextManager().registerProperty("chinese-llm", &factory_);
 
@@ -88,27 +95,49 @@ ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
         fcitx::EventWatcherPhase::PostInputMethod,
         [this](fcitx::Event &event) { handleKeyEvent(event); }));
 
+    // Composition boundaries invalidate replies even if the next input is
+    // identical. Do this before the engine clears or changes its own state.
+    for (const auto type :
+         {EventType::InputContextReset, EventType::InputContextFocusOut,
+          EventType::InputContextSwitchInputMethod,
+          EventType::InputContextCapabilityAboutToChange,
+          EventType::InputContextSurroundingTextUpdated}) {
+        eventWatchers_.emplace_back(instance_->watchEvent(
+            type, EventWatcherPhase::PreInputMethod, [this](Event &event) {
+                auto *ic =
+                    static_cast<InputContextEvent &>(event).inputContext();
+                invalidateState(ic, ic->propertyFor(&factory_));
+            }));
+    }
+
     worker_->start();
-    FCITX_INFO() << "chinese-llm: loaded, endpoint " << config_.endpoint.value();
+    FCITX_INFO() << "chinese-llm: loaded, endpoint "
+                 << config_.endpoint.value();
 }
 
-ChineseLlm::~ChineseLlm() { worker_->stop(); }
+ChineseLlm::~ChineseLlm() {
+    eventWatchers_.clear();
+    invalidateAll();
+    worker_->stop();
+}
 
 void ChineseLlm::reloadConfig() {
     readAsIni(config_, "conf/chinese-llm.conf");
-    // Any in-flight reply was produced under the old settings; drop it rather
-    // than mix output from two different models in one candidate list.
-    if (worker_) {
-        worker_->cancelAll();
-    }
+    invalidateAll();
+    cache_.clear();
+    cacheOrder_.clear();
+    errorCount_ = 0;
+    cooldownUntil_ = {};
 }
 
 void ChineseLlm::setConfig(const fcitx::RawConfig &config) {
     config_.load(config, true);
     fcitx::safeSaveAsIni(config_, "conf/chinese-llm.conf");
-    if (worker_) {
-        worker_->cancelAll();
-    }
+    invalidateAll();
+    cache_.clear();
+    cacheOrder_.clear();
+    errorCount_ = 0;
+    cooldownUntil_ = {};
 }
 
 void ChineseLlm::save() {
@@ -134,7 +163,7 @@ BackendConfig ChineseLlm::backendConfig() const {
 }
 
 bool ChineseLlm::isEligible(fcitx::InputContext *ic) {
-    if (!config_.enabled.value()) {
+    if (!config_.enabled.value() || !ic->hasFocus()) {
         return false;
     }
     // Never look at a password field, even to read the preedit.
@@ -150,7 +179,10 @@ bool ChineseLlm::isEligible(fcitx::InputContext *ic) {
         return false;
     }
     auto candidateList = ic->inputPanel().candidateList();
-    if (!candidateList || candidateList->empty()) {
+    // Stroke/action filters deliberately make CommonCandidateList immutable.
+    // Do not send or insert model output while the engine owns such a view.
+    if (!candidateList || candidateList->empty() ||
+        !candidateList->toModifiable()) {
         return false;
     }
     if (inCooldown()) {
@@ -178,18 +210,78 @@ std::string ChineseLlm::buildContext(fcitx::InputContext *ic) const {
         cursor > length) {
         return {};
     }
-    const size_t usable =
-        std::min<size_t>(cursor, static_cast<size_t>(limit));
-    // Start `usable` characters before the cursor. ncharByteLength on a char
-    // iterator walks from that many characters *after* the cursor, so measure
-    // from the beginning of the string instead.
-    const auto startChar = std::next(fcitx::utf8::MakeUTF8CharRange(text).begin(),
-                                     static_cast<ptrdiff_t>(cursor - usable));
-    const auto endChar = std::next(
-        fcitx::utf8::MakeUTF8CharRange(text).begin(),
-        static_cast<ptrdiff_t>(cursor));
-    return std::string(startChar.view().data(), startChar.view().size()) +
-           std::string(endChar.view().data(), endChar.view().size());
+    const size_t usable = std::min<size_t>(cursor, static_cast<size_t>(limit));
+    const auto start = utf8::nextNChar(text.begin(), cursor - usable);
+    const auto end = utf8::nextNChar(text.begin(), cursor);
+    return std::string(start, end);
+}
+
+std::string ChineseLlm::currentPinyin(fcitx::InputContext *ic) const {
+    // CommitPreview uses Han client preedit alongside raw server preedit.
+    // Prefer the server field when present; both are mixed after partial
+    // selection.
+    auto preedit = ic->inputPanel().preedit().toString();
+    if (preedit.empty()) {
+        preedit = ic->inputPanel().clientPreedit().toString();
+    }
+    if (!isPlainPinyin(preedit)) {
+        return {};
+    }
+    std::replace(preedit.begin(), preedit.end(), ' ', '\'');
+    if (preedit.size() > MAX_PINYIN_LENGTH ||
+        static_cast<int>(preedit.size()) < config_.minPinyinLength.value()) {
+        return {};
+    }
+    return preedit;
+}
+
+std::string ChineseLlm::cacheKey(const std::string &pinyin,
+                                 const std::string &context) {
+    // Plain pinyin never contains NUL, so this delimiter is unambiguous even
+    // when preceding text itself contains arbitrary bytes.
+    return pinyin + '\0' + context;
+}
+
+void ChineseLlm::removeCandidates(fcitx::InputContext *ic, LlmState *state) {
+    auto list = ic->inputPanel().candidateList();
+    auto *modifiable = list ? list->toModifiable() : nullptr;
+    if (!modifiable) {
+        return;
+    }
+    bool removed = false;
+    for (int i = modifiable->totalSize() - 1; i >= 0; --i) {
+        if (dynamic_cast<const LlmCandidateWord *>(
+                &modifiable->candidateFromAll(i))) {
+            modifiable->remove(i);
+            removed = true;
+        }
+    }
+    if (removed) {
+        state->inserting = true;
+        ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+        state->inserting = false;
+    }
+}
+
+void ChineseLlm::invalidateState(fcitx::InputContext *ic, LlmState *state) {
+    state->generation++;
+    state->debounce.reset();
+    if (state->requestSeq && state->requestSeq == worker_->currentSeq()) {
+        worker_->cancelAll();
+    }
+    state->requestSeq = 0;
+    state->pinyin.clear();
+    state->context.clear();
+    state->candidates.clear();
+    removeCandidates(ic, state);
+}
+
+void ChineseLlm::invalidateAll() {
+    worker_->cancelAll();
+    instance_->inputContextManager().foreach([this](InputContext *ic) {
+        invalidateState(ic, ic->propertyFor(&factory_));
+        return true;
+    });
 }
 
 void ChineseLlm::handleUpdateUI(fcitx::Event &event) {
@@ -208,48 +300,35 @@ void ChineseLlm::handleUpdateUI(fcitx::Event &event) {
         return;
     }
     if (!isEligible(ic)) {
+        invalidateState(ic, state);
         return;
     }
-
-    // The pinyin being typed comes from one of two places depending on whether
-    // the client advertises the Preedit capability. In ComposingPinyin mode the
-    // engine fills clientPreedit; otherwise (PreeditMode::No, which is what a
-    // client without the flag gets) it only fills the server side preedit. See
-    // PinyinEngine::preedit() in fcitx5-chinese-addons. Reading only the client
-    // one silently does nothing in any client that does not support preedit.
-    auto preedit = ic->inputPanel().clientPreedit().toString();
-    if (preedit.empty()) {
-        preedit = ic->inputPanel().preedit().toString();
-    }
-    // Once the user selects a character the preedit becomes a Han/pinyin mix and
-    // we step away, because the public API offers no reliable way to split it.
-    if (!isPlainPinyin(preedit)) {
+    auto pinyin = currentPinyin(ic);
+    if (pinyin.empty()) {
+        invalidateState(ic, state);
         return;
     }
-    std::string pinyin = preedit;
-    std::replace(pinyin.begin(), pinyin.end(), ' ', '\'');
-    if (pinyin.size() > MAX_PINYIN_LENGTH) {
+    auto context = buildContext(ic);
+    if (state->pinyin == pinyin && state->context == context) {
+        // The engine can rebuild the list without changing the composition,
+        // for example when paging or moving its cursor.
+        insertCandidates(ic, state, state->candidates);
         return;
     }
-    // The length is compared against characters, not syllables, because the
-    // separator form varies with the engine's segmentation.
-    if (static_cast<int>(utf8::length(pinyin)) <
-        config_.minPinyinLength.value()) {
-        return;
-    }
-    if (state->pinyin == pinyin) {
-        return;
-    }
+    invalidateState(ic, state);
     state->pinyin = pinyin;
-    state->generation++;
+    state->context = context;
 
-    // A cache hit can be shown without a round trip and without debouncing.
-    if (const auto iter = cache_.find(pinyin); iter != cache_.end()) {
-        insertCandidates(ic, state, iter->second);
+    const auto key = cacheKey(pinyin, context);
+    if (const auto iter = cache_.find(key); iter != cache_.end()) {
+        std::erase(cacheOrder_, key);
+        cacheOrder_.push_back(key);
+        state->candidates = iter->second;
+        insertCandidates(ic, state, state->candidates);
         return;
     }
 
-    scheduleRequest(ic, state, std::move(pinyin), buildContext(ic));
+    scheduleRequest(ic, state, std::move(pinyin), std::move(context));
 }
 
 void ChineseLlm::scheduleRequest(fcitx::InputContext *ic, LlmState *state,
@@ -261,25 +340,23 @@ void ChineseLlm::scheduleRequest(fcitx::InputContext *ic, LlmState *state,
         return;
     }
 
-    // The debounce timer lives per input context and is restarted on every
-    // keystroke, so a burst of typing produces exactly one request. Doing this
-    // here rather than in the worker matters: once a request has started, the
-    // worker cannot abandon it, and a local model takes long enough that a
-    // started request is already wasted.
+    // Debounce before submission, so a burst of typing produces one request
+    // instead of starting work the server may continue even after curl aborts.
     state->debounce = instance_->eventLoop().addTimeEvent(
         CLOCK_MONOTONIC,
         fcitx::now(CLOCK_MONOTONIC) + static_cast<uint64_t>(debounce) * 1000,
         static_cast<uint64_t>(debounce) * 1000,
-        [this, ref = ic->watch(), pinyin = std::move(pinyin),
+        [this, owner = watch(), ref = ic->watch(),
+         generation = state->generation, pinyin = std::move(pinyin),
          context = std::move(context)](fcitx::EventSourceTime *,
                                        uint64_t) mutable {
             auto *inputContext = ref.get();
-            if (!inputContext) {
+            if (!owner.isValid() || !inputContext) {
                 return true;
             }
             auto *cur = inputContext->propertyFor(&factory_);
             dispatchRequest(inputContext, cur, std::move(pinyin),
-                            std::move(context), cur->generation);
+                            std::move(context), generation);
             return true;
         });
     state->debounce->setOneShot();
@@ -288,51 +365,59 @@ void ChineseLlm::scheduleRequest(fcitx::InputContext *ic, LlmState *state,
 void ChineseLlm::dispatchRequest(fcitx::InputContext *ic, LlmState *state,
                                  std::string pinyin, std::string context,
                                  uint64_t generation) {
-    // Take the weak reference here, on the main thread. Creating one inside the
-    // worker would touch the input context from the wrong thread.
+    if (state->generation != generation || !isEligible(ic) ||
+        currentPinyin(ic) != pinyin || buildContext(ic) != context) {
+        return;
+    }
+    // Create references on the main thread and only dereference them there.
+    // The dispatcher outlives the addon; queued callbacks also track the addon,
+    // not only the client, so unloading cannot leave a raw-this callback
+    // behind.
     auto ref = ic->watch();
-    worker_->submit(
-        backendConfig(), std::move(pinyin), std::move(context),
-        [this, ref = std::move(ref),
+    state->requestSeq = worker_->submit(
+        backendConfig(), std::move(pinyin), context,
+        [dispatcher = &dispatcher_, owner = watch(), ref, context,
          generation](FetchResult result) {
-            dispatcher_.scheduleWithContext(ref, [this, ref, generation,
-                                                  result = std::move(result)]() {
-                auto *inputContext = ref.get();
-                if (!inputContext) {
+            dispatcher->schedule([owner, ref, context, generation,
+                                  result = std::move(result)]() {
+                auto *self = owner.get();
+                auto *ic = ref.get();
+                if (!self || !ic) {
                     return;
                 }
-                auto *state = inputContext->propertyFor(&factory_);
-                if (state->generation != generation) {
-                    // The user typed on; this reply is about an older pinyin.
+                auto *state = ic->propertyFor(&self->factory_);
+                if (result.seq != self->worker_->currentSeq() ||
+                    state->generation != generation || !self->isEligible(ic) ||
+                    self->currentPinyin(ic) != result.pinyin ||
+                    self->buildContext(ic) != context) {
                     return;
                 }
+                state->requestSeq = 0;
                 if (!result.ok) {
-                    noteError(result.error);
+                    self->noteError(result.error);
                     return;
                 }
+                self->errorCount_ = 0;
+                state->candidates = result.candidates;
                 if (result.candidates.empty()) {
-                    // A well-formed reply that sanitize rejected is not an
-                    // endpoint failure, so it does not count towards cooldown.
                     return;
                 }
-                errorCount_ = 0;
-                rememberCandidates(result.pinyin, result.candidates);
-                insertCandidates(inputContext, state, result.candidates);
+                self->rememberCandidates(cacheKey(result.pinyin, context),
+                                         result.candidates);
+                self->insertCandidates(ic, state, state->candidates);
             });
         });
 }
 
-void ChineseLlm::rememberCandidates(const std::string &pinyin,
-                                    const std::vector<std::string> &candidates) {
+void ChineseLlm::rememberCandidates(
+    const std::string &key, const std::vector<std::string> &candidates) {
     const int cacheSize = config_.cacheSize.value();
     if (cacheSize <= 0) {
         return;
     }
-    if (cache_.find(pinyin) != cache_.end()) {
-        return;
-    }
-    cache_.emplace(pinyin, candidates);
-    cacheOrder_.push_back(pinyin);
+    cache_.insert_or_assign(key, candidates);
+    std::erase(cacheOrder_, key);
+    cacheOrder_.push_back(key);
     while (static_cast<int>(cacheOrder_.size()) > cacheSize) {
         cache_.erase(cacheOrder_.front());
         cacheOrder_.erase(cacheOrder_.begin());
@@ -391,15 +476,26 @@ void ChineseLlm::insertCandidates(fcitx::InputContext *ic, LlmState *state,
     const int position =
         std::clamp(config_.candidateIndex.value() - 1, 0, total);
 
+    const auto valid = [owner = watch(), ref = ic->watch(),
+                        generation = state->generation, pinyin = state->pinyin,
+                        context = state->context](InputContext *selectedIc) {
+        auto *self = owner.get();
+        auto *ic = ref.get();
+        if (!self || !ic || selectedIc != ic || !self->isEligible(ic)) {
+            return false;
+        }
+        return ic->propertyFor(&self->factory_)->generation == generation &&
+               self->currentPinyin(ic) == pinyin &&
+               self->buildContext(ic) == context;
+    };
     state->inserting = true;
     // Insert back to front so the first candidate ends up first on screen.
     for (int i = static_cast<int>(toInsert.size()) - 1; i >= 0; i--) {
-        modifiable->insert(position,
-                           std::make_unique<LlmCandidateWord>(toInsert[i], badge));
+        modifiable->insert(position, std::make_unique<LlmCandidateWord>(
+                                         toInsert[i], badge, valid));
     }
-    state->inserting = false;
-
     ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+    state->inserting = false;
 }
 
 void ChineseLlm::handleKeyEvent(fcitx::Event &event) {
@@ -417,19 +513,17 @@ void ChineseLlm::handleKeyEvent(fcitx::Event &event) {
 void ChineseLlm::toggle() {
     config_.enabled.setValue(!config_.enabled.value());
     fcitx::safeSaveAsIni(config_, "conf/chinese-llm.conf");
-    if (!config_.enabled.value()) {
-        worker_->cancelAll();
-        errorCount_ = 0;
-        cooldownUntil_ = std::chrono::steady_clock::time_point{};
-    }
+    invalidateAll();
+    errorCount_ = 0;
+    cooldownUntil_ = {};
     FCITX_INFO() << "chinese-llm: "
                  << (config_.enabled.value() ? "enabled" : "disabled");
 }
 
 void ChineseLlm::noteError(const std::string &error) {
     errorCount_++;
-    FCITX_DEBUG() << "chinese-llm: request failed (" << errorCount_
-                  << "): " << error;
+    FCITX_LOGC(chinesellm, Debug)
+        << "chinese-llm: request failed (" << errorCount_ << "): " << error;
     if (errorCount_ >= config_.maxConsecutiveErrors.value()) {
         // Stop hammering a dead endpoint. Typing keeps working because the
         // worker is bypassed entirely while cooling down.
@@ -449,8 +543,11 @@ bool ChineseLlm::inCooldown() const {
 }
 
 void ChineseLlm::expireCooldown() {
-    cooldownUntil_ = std::chrono::steady_clock::time_point{};
-    errorCount_ = 0;
+    if (cooldownUntil_ != std::chrono::steady_clock::time_point{} &&
+        !inCooldown()) {
+        cooldownUntil_ = {};
+        errorCount_ = 0;
+    }
 }
 
 } // namespace fcitx::chinesellm
