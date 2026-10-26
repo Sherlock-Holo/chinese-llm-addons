@@ -11,14 +11,26 @@ for tool in python3 curl timeout mktemp; do
 done
 [[ -d "$BUILD_DIR" ]] || { echo "error: configure and build '$BUILD_DIR' first" >&2; exit 1; }
 BUILD_DIR="$(cd "$BUILD_DIR" && pwd)"
-for name in testllmbackend testllmworker testllmaddon; do
+for name in testllmbackend testllmconfig testllmworker testllmaddon; do
     [[ -x "$BUILD_DIR/bin/$name" ]] || {
         echo "error: missing $BUILD_DIR/bin/$name; build with ENABLE_TEST=ON" >&2; exit 1;
     }
 done
-[[ -f "$BUILD_DIR/test/addon/chinese-llm.conf" ]] || {
-    echo "error: missing build-tree addon metadata; build the testllmaddon target" >&2; exit 1;
+[[ -f "$BUILD_DIR/test/addon/chinese-llm.conf" &&
+   -f "$BUILD_DIR/test/inputmethod/llm-pinyin.conf" ]] || {
+    echo "error: missing build-tree addon/inputmethod metadata; build the testllmaddon target" >&2; exit 1;
 }
+
+for helper in punctuation fullwidth chttrans pinyinhelper; do
+    [[ -f "$BUILD_DIR/test/addon/chinese-llm-$helper.conf" ]] || {
+        echo "error: missing private helper metadata: chinese-llm-$helper" >&2; exit 1;
+    }
+done
+for resource in symbols chaizi.dict punctuation/punc.mb.zh_CN chttrans/gbks2t.tab pinyinhelper/py_stroke.mb pinyinhelper/py_table.mb; do
+    [[ -f "$BUILD_DIR/test/chinese-llm/$resource" ]] || {
+        echo "error: missing private data: chinese-llm/$resource" >&2; exit 1;
+    }
+done
 
 # Fcitx's module package exports interface headers, not its runtime .so path.
 # CMake discovers the library directory; callers may override unusual layouts.
@@ -106,17 +118,68 @@ run_checked() {
 
 # Backend has no network; worker covers network/cancel/redirect/error paths.
 run_checked backend 'All tests passed' "$RUN_DIR/backend.log" "$BUILD_DIR/bin/testllmbackend"
+run_checked config 'All config tests passed' "$RUN_DIR/config.log" "$BUILD_DIR/bin/testllmconfig"
 run_checked worker 'All worker tests passed' "$RUN_DIR/worker.log" \
     "$BUILD_DIR/bin/testllmworker" "$BASE/v1/chat/completions"
 
-for scenario in live debounce disabled dead preview reset partial toggle toggle-inflight sensitive sensitive-inflight context cache cooldown config filtered; do
+for scenario in live debounce disabled dead preview reset partial toggle toggle-inflight sensitive sensitive-inflight context cache cooldown config filtered metadata original-pinyin original-shuangpin switch-inflight switch-results own-config virtual-keyboard preedit-click modifier-selection modifier-selection-global llm-alone private-settings customphrase-isolation learning-isolation learning-reload private-actions native-description; do
     scenario_dir="$RUN_DIR/$scenario"
     mkdir -p "$scenario_dir"/{config/conf,data,cache,runtime}
     chmod 700 "$scenario_dir/runtime"
     # An explicit profile avoids host preferences and first-run IM selection.
-    printf '%s\n' '[Groups/0]' 'Name=Default' 'Default Layout=us' 'DefaultIM=pinyin' \
-        '' '[Groups/0/Items/0]' 'Name=pinyin' 'Layout=' \
+    default_im=llm-pinyin
+    case "$scenario" in
+        original-pinyin) default_im=pinyin ;;
+        original-shuangpin) default_im=shuangpin ;;
+    esac
+    printf '%s\n' '[Groups/0]' 'Name=Default' 'Default Layout=us' "DefaultIM=$default_im" \
+        '' '[Groups/0/Items/0]' 'Name=llm-pinyin' 'Layout=' \
+        '' '[Groups/0/Items/1]' 'Name=pinyin' 'Layout=' \
+        '' '[Groups/0/Items/2]' 'Name=shuangpin' 'Layout=' \
         '' '[GroupOrder]' '0=Default' >"$scenario_dir/config/profile"
+    if [[ "$scenario" == llm-alone || "$scenario" == learning-isolation || "$scenario" == learning-reload ]]; then
+        printf '%s\n' '[Groups/0]' 'Name=Default' 'Default Layout=us' 'DefaultIM=llm-pinyin' \
+            '' '[Groups/0/Items/0]' 'Name=llm-pinyin' 'Layout=' \
+            '' '[GroupOrder]' '0=Default' >"$scenario_dir/config/profile"
+        python3 - "$scenario_dir" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+files = {
+    "config/conf/pinyin.conf": "# official sentinel\nPageSize=9\nPrediction=False\n",
+    "config/conf/punctuation.conf": "# official punctuation sentinel\n",
+    "config/conf/fullwidth.conf": "# official fullwidth sentinel\n",
+    "config/conf/chttrans.conf": "# official conversion sentinel\n",
+    "config/conf/pinyinhelper.conf": "# official pinyinhelper sentinel\n",
+    "config/pinyin/sp.dat": "official-shuangpin-sentinel\n",
+    "data/pinyin/user.dict": "official-userdict-sentinel\n",
+    "data/pinyin/user.history": "official-history-sentinel\n",
+    "data/pinyin/customphrase": "zzzz,1=原生短语\n",
+    "data/pinyin/dictionaries/sentinel.dict": "official-extradict-sentinel\n",
+    "data/punctuation/punc.mb.zh_CN": "official-punctuation-data-sentinel\n",
+    "data/chttrans/gbks2t.tab": "official-conversion-data-sentinel\n",
+    "data/pinyinhelper/py_stroke.mb": "official-stroke-data-sentinel\n",
+    "data/pinyinhelper/py_table.mb": "official-py-table-data-sentinel\n",
+}
+checksums = {}
+for name, value in files.items():
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value)
+    checksums[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+(root / "official-sentinels.json").write_text(json.dumps(checksums))
+PY
+        if [[ "$scenario" == learning-reload ]]; then
+            mkdir -p "$scenario_dir/data/chinese-llm"
+            cp "$RUN_DIR/learning-isolation/data/chinese-llm/user.dict" \
+               "$RUN_DIR/learning-isolation/data/chinese-llm/user.history" "$scenario_dir/data/chinese-llm/"
+        fi
+    elif [[ "$scenario" == customphrase-isolation ]]; then
+        mkdir -p "$scenario_dir/data/pinyin"
+        printf '%s\n' 'zzzz,1=原生短语' >"$scenario_dir/data/pinyin/customphrase"
+    fi
     curl --noproxy '*' --fail --silent --max-time 2 -X POST "$BASE/reset" > /dev/null
     endpoint="$BASE/v1/chat/completions"
     case "$scenario" in
@@ -133,6 +196,39 @@ for scenario in live debounce disabled dead preview reset partial toggle toggle-
             XDG_CACHE_HOME="$scenario_dir/cache" XDG_RUNTIME_DIR="$scenario_dir/runtime" \
             "$BUILD_DIR/bin/testllmaddon" "$endpoint" "--scenario=$scenario"
     curl --noproxy '*' --fail --silent --max-time 2 "$BASE/stats" >"$scenario_dir/stats.json"
+    # Normal Fcitx shutdown saves the official pinyin addon too. Compare its
+    # full settings against the pre-test baseline; do not flag file creation.
+    # Every setup, including preview/click/modifiers, changes private config only.
+    if ! python3 - "$scenario_dir" "$scenario" <<'PY'
+import json
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+scenario = sys.argv[2]
+if scenario in {"llm-alone", "learning-isolation", "learning-reload"}:
+    import hashlib
+    checksums = json.loads((root / "official-sentinels.json").read_text())
+    for name, expected_hash in checksums.items():
+        assert hashlib.sha256((root / name).read_bytes()).hexdigest() == expected_hash, f"official sentinel changed: {name}"
+    originals = set(checksums)
+    for directory in ["data/pinyin", "config/pinyin", "data/punctuation", "data/chttrans", "data/pinyinhelper"]:
+        assert all(str(path.relative_to(root)) in originals for path in (root / directory).rglob("*") if path.is_file()), f"new official data created: {directory}"
+    assert (root / "config/conf/chinese-llm-pinyin.conf").is_file(), "private native configuration not saved"
+    assert (root / "data/chinese-llm/user.dict").is_file() and (root / "data/chinese-llm/user.history").is_file(), "private learning files not saved"
+    sys.exit(0)
+prefix = "official-config-baseline: "
+lines = (root / "test.log").read_text().splitlines()
+baselines = [json.loads(line[len(prefix):]) for line in lines if line.startswith(prefix)]
+assert len(baselines) == 1, "official configuration baseline missing or duplicated"
+persisted = root / "config/conf/pinyin.conf"
+assert persisted.is_file(), "official pinyin configuration was not saved on normal exit"
+assert persisted.read_text() == baselines[0], "LLM entry overwrote official pinyin/shuangpin settings"
+assert not (root / "config/conf/shuangpin.conf").exists(), "LLM unexpectedly wrote a separate shuangpin configuration"
+PY
+    then
+        echo "FAILED: addon/$scenario changed official pinyin/shuangpin configuration" >&2
+        failures=$((failures + 1))
+    fi
     # Count assertions supplement in-process candidate/state assertions.
     if ! python3 - "$scenario" "$scenario_dir/stats.json" <<'PY'
 import json
@@ -143,9 +239,17 @@ count = stats["count"]
 expected = {"live": 1, "debounce": 1, "disabled": 0, "dead": 0,
             "preview": 1, "sensitive": 0, "toggle": 0, "partial": 1,
             "toggle-inflight": 1, "sensitive-inflight": 1,
-            "reset": 2, "context": 2, "cache": 2, "cooldown": 2, "config": 2, "filtered": 1}
-if scenario in expected:
-    assert count == expected[scenario], f"{scenario}: expected {expected[scenario]} POSTs, got {count}"
+            "reset": 2, "context": 2, "cache": 2, "cooldown": 2, "config": 2, "filtered": 1,
+            "metadata": 0, "original-pinyin": 0, "original-shuangpin": 0,
+            "switch-inflight": 2, "switch-results": 1, "own-config": 0,
+            "virtual-keyboard": 1, "preedit-click": 1, "modifier-selection": 1,
+            "modifier-selection-global": 1,
+            "llm-alone": 1, "private-settings": 0, "customphrase-isolation": 0,
+            "learning-isolation": 0, "learning-reload": 0, "private-actions": 0, "native-description": 0}
+assert scenario in expected, f"missing request-count assertion for {scenario}"
+assert count == expected[scenario], f"{scenario}: expected {expected[scenario]} POSTs, got {count}"
+if scenario in {"own-config", "metadata", "original-pinyin", "original-shuangpin"}:
+    assert not stats["requests"], f"{scenario}: original/config-only path touched network"
 print(f"  server requests: {count}")
 PY
     then

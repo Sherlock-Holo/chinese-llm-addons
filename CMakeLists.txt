@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.6.0)
+cmake_minimum_required(VERSION 3.12.0)
 project(fcitx5-chinese-addons VERSION 5.1.15)
 
 set(REQUIRED_FCITX_VERSION 5.1.22)
@@ -49,9 +49,21 @@ if (NOT ENABLE_CHINESE_LLM_ONLY)
     find_package(Fcitx5Module REQUIRED COMPONENTS Notifications QuickPhrase Spell Clipboard)
     find_package(Fcitx5ModuleLuaAddonLoader)
     find_package(Gettext REQUIRED)
+    find_package(LibIMETable ${REQUIRED_LIBIME_VERSION} REQUIRED)
+endif()
+if (NOT ENABLE_CHINESE_LLM_ONLY OR ENABLE_CHINESE_LLM)
+    # The LLM entry now owns its native engine instead of loading pinyin.
     find_package(Boost 1.61 REQUIRED)
     find_package(LibIMEPinyin ${REQUIRED_LIBIME_VERSION} REQUIRED)
-    find_package(LibIMETable ${REQUIRED_LIBIME_VERSION} REQUIRED)
+endif()
+if (ENABLE_CHINESE_LLM)
+    find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
+    set(CHINESE_LLM_PYTHON_EXECUTABLE "${Python3_EXECUTABLE}")
+    if (ENABLE_CHINESE_LLM_ONLY)
+        # Stable Fcitx core-module interfaces only; Chinese interfaces are
+        # generated locally. No installed PinyinHelper/Punctuation package.
+        find_package(Fcitx5Module REQUIRED COMPONENTS Notifications QuickPhrase Spell)
+    endif()
 endif()
 
 include("${FCITX_INSTALL_CMAKECONFIG_DIR}/Fcitx5Utils/Fcitx5CompilerSettings.cmake")

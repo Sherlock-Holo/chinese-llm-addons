@@ -9,6 +9,25 @@ if (ENABLE_CHINESE_LLM)
             "${PROJECT_BINARY_DIR}/modules/chinese-llm/chinese-llm.conf"
             "${CMAKE_CURRENT_BINARY_DIR}/chinese-llm.conf"
         DEPENDS chinese-llm)
+    add_custom_target(copy-private-chinese-llm
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${PROJECT_BINARY_DIR}/modules/chinese-llm/native/chinese-llm-punctuation.conf"
+            "${PROJECT_BINARY_DIR}/modules/chinese-llm/native/chinese-llm-fullwidth.conf"
+            "${PROJECT_BINARY_DIR}/modules/chinese-llm/native/chinese-llm-chttrans.conf"
+            "${PROJECT_BINARY_DIR}/modules/chinese-llm/native/chinese-llm-pinyinhelper.conf"
+            "${CMAKE_CURRENT_BINARY_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${PROJECT_BINARY_DIR}/modules/chinese-llm/native/data/chinese-llm"
+            "${PROJECT_BINARY_DIR}/test/chinese-llm"
+        DEPENDS chinese-llm-native-data chinese-llm-punctuation
+            chinese-llm-fullwidth chinese-llm-chttrans chinese-llm-pinyinhelper)
+    add_custom_target(copy-inputmethod-llm-pinyin
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${PROJECT_BINARY_DIR}/test/inputmethod"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${PROJECT_BINARY_DIR}/modules/chinese-llm/llm-pinyin.conf"
+            "${PROJECT_BINARY_DIR}/test/inputmethod/llm-pinyin.conf"
+        DEPENDS chinese-llm)
 endif()
 
 if (ENABLE_CHINESE_LLM_ONLY)

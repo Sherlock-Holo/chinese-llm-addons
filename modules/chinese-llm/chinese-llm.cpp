@@ -6,6 +6,7 @@
 #include "chinese-llm.h"
 #include "llmbackend.h"
 #include "llmworker.h"
+#include "native/pinyin/pinyin.h"
 #include <algorithm>
 #include <cstdlib>
 #include <fcitx-utils/capabilityflags.h>
@@ -75,7 +76,9 @@ private:
 } // namespace
 
 ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
-    : worker_(std::make_unique<LlmWorker>()), instance_(manager->instance()),
+    : pinyin_(std::make_unique<fcitx::llmnative::PinyinEngine>(
+          manager->instance())),
+      worker_(std::make_unique<LlmWorker>()), instance_(manager->instance()),
       dispatcher_(manager->instance()->eventDispatcher()) {
     instance_->inputContextManager().registerProperty("chinese-llm", &factory_);
 
@@ -121,9 +124,62 @@ ChineseLlm::~ChineseLlm() {
     worker_->stop();
 }
 
+void ChineseLlm::keyEvent(const InputMethodEntry &, KeyEvent &event) {
+    pinyin_->keyEvent(pinyinEntry_, event);
+}
+
+void ChineseLlm::activate(const InputMethodEntry &, InputContextEvent &event) {
+    auto *ic = event.inputContext();
+    invalidateState(ic, ic->propertyFor(&factory_));
+    pinyin_->activate(pinyinEntry_, event);
+}
+
+void ChineseLlm::deactivate(const InputMethodEntry &,
+                            InputContextEvent &event) {
+    auto *ic = event.inputContext();
+    // Remove AI candidates before native deactivation handles commit/clear.
+    invalidateState(ic, ic->propertyFor(&factory_));
+    pinyin_->deactivate(pinyinEntry_, event);
+}
+
+void ChineseLlm::reset(const InputMethodEntry &, InputContextEvent &event) {
+    auto *ic = event.inputContext();
+    invalidateState(ic, ic->propertyFor(&factory_));
+    pinyin_->reset(pinyinEntry_, event);
+}
+
+void ChineseLlm::filterKey(const InputMethodEntry &, KeyEvent &event) {
+    pinyin_->filterKey(pinyinEntry_, event);
+}
+
+std::string ChineseLlm::subMode(const InputMethodEntry &, InputContext &ic) {
+    return pinyin_->subMode(pinyinEntry_, ic);
+}
+
+std::string ChineseLlm::subModeIconImpl(const InputMethodEntry &,
+                                        InputContext &ic) {
+    return pinyin_->subModeIcon(pinyinEntry_, ic);
+}
+
+std::string ChineseLlm::subModeLabelImpl(const InputMethodEntry &,
+                                         InputContext &) {
+    return "LLM";
+}
+
+void ChineseLlm::invokeActionImpl(const InputMethodEntry &,
+                                  InvokeActionEvent &event) {
+    pinyin_->invokeAction(pinyinEntry_, event);
+}
+
+void ChineseLlm::virtualKeyboardEventImpl(const InputMethodEntry &,
+                                          VirtualKeyboardEvent &event) {
+    pinyin_->virtualKeyboardEvent(pinyinEntry_, event);
+}
+
 void ChineseLlm::reloadConfig() {
     readAsIni(config_, "conf/chinese-llm.conf");
     invalidateAll();
+    pinyin_->reloadConfig();
     cache_.clear();
     cacheOrder_.clear();
     errorCount_ = 0;
@@ -142,6 +198,31 @@ void ChineseLlm::setConfig(const fcitx::RawConfig &config) {
 
 void ChineseLlm::save() {
     fcitx::safeSaveAsIni(config_, "conf/chinese-llm.conf");
+    pinyin_->save();
+}
+
+const Configuration *ChineseLlm::getSubConfig(const std::string &path) const {
+    if (path == "pinyin") {
+        // The private engine is full-pinyin-only and already hides unsupported
+        // options. Return its live configuration, not upstream's cached
+        // pyConfig copy, so toolbar prediction toggles are reflected in this
+        // GUI page.
+        return pinyin_->getConfig();
+    }
+    return nullptr;
+}
+
+void ChineseLlm::setSubConfig(const std::string &path,
+                              const RawConfig &config) {
+    // All native setters/commands target the owned private engine. Never
+    // forward a config URL or a command to the installed pinyin addon.
+    if (path == "pinyin") {
+        invalidateAll();
+        pinyin_->setConfigForInputMethod(pinyinEntry_, config);
+    } else if (path.starts_with("pinyin/")) {
+        invalidateAll();
+        pinyin_->setSubConfig(path.substr(7), config);
+    }
 }
 
 BackendConfig ChineseLlm::backendConfig() const {
@@ -162,6 +243,12 @@ BackendConfig ChineseLlm::backendConfig() const {
     return backend;
 }
 
+bool ChineseLlm::isLlmInputMethod(fcitx::InputContext *ic) const {
+    const auto *entry = instance_->inputMethodEntry(ic);
+    return entry && entry->uniqueName() == "llm-pinyin" &&
+           entry->addon() == "chinese-llm";
+}
+
 bool ChineseLlm::isEligible(fcitx::InputContext *ic) {
     if (!config_.enabled.value() || !ic->hasFocus()) {
         return false;
@@ -171,11 +258,8 @@ bool ChineseLlm::isEligible(fcitx::InputContext *ic) {
             fcitx::CapabilityFlag::PasswordOrSensitive)) {
         return false;
     }
-    const auto *entry = instance_->inputMethodEntry(ic);
-    if (!entry || entry->addon() != "pinyin") {
-        return false;
-    }
-    if (config_.skipShuangpin.value() && entry->uniqueName() == "shuangpin") {
+    // Neither normal pinyin nor shuangpin is opted into model requests.
+    if (!isLlmInputMethod(ic)) {
         return false;
     }
     auto candidateList = ic->inputPanel().candidateList();
@@ -500,7 +584,7 @@ void ChineseLlm::insertCandidates(fcitx::InputContext *ic, LlmState *state,
 
 void ChineseLlm::handleKeyEvent(fcitx::Event &event) {
     auto &keyEvent = static_cast<fcitx::KeyEvent &>(event);
-    if (keyEvent.isRelease()) {
+    if (keyEvent.isRelease() || !isLlmInputMethod(keyEvent.inputContext())) {
         return;
     }
     if (!keyEvent.key().checkKeyList(config_.toggleKey.value())) {

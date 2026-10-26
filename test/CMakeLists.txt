@@ -40,11 +40,11 @@ target_include_directories(testllmworker PRIVATE ${PROJECT_SOURCE_DIR}/modules/c
 target_link_libraries(testllmworker Fcitx5::Core nlohmann_json::nlohmann_json PkgConfig::Curl Pthread::Pthread)
 
 # Also driven by scripts/smoke.sh: it creates its own fcitx5 Instance and
-# loads the installed pinyin/testfrontend addons plus the build-tree LLM addon.
+# loads installed pinyin/testfrontend plus the build-tree LLM engine/IM metadata.
 add_executable(testllmaddon testllmaddon.cpp)
 target_include_directories(testllmaddon PRIVATE ${PROJECT_SOURCE_DIR}/modules/chinese-llm)
 target_link_libraries(testllmaddon Fcitx5::Core Fcitx5::Config Fcitx5::Module::TestFrontend PkgConfig::Curl nlohmann_json::nlohmann_json)
-add_dependencies(testllmaddon chinese-llm copy-addon-chinese-llm)
+add_dependencies(testllmaddon chinese-llm copy-addon-chinese-llm copy-inputmethod-llm-pinyin copy-private-chinese-llm)
 
 # The module CMake package exposes headers, not the runtime module location.
 # Record discovery for smoke.sh; the cache variable allows nonstandard layouts.

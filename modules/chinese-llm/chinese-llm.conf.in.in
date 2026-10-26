@@ -1,16 +1,17 @@
 [Addon]
-Name=Chinese LLM
-Comment=LLM powered pinyin candidates via an OpenAI compatible endpoint
-Category=Module
+Name=LLM拼音
+Comment=Independent LLM enhanced pinyin input method via an OpenAI compatible endpoint
+Category=InputMethod
 Version=@PROJECT_VERSION@
 Library=libchinese-llm
 Type=@FCITX_ADDON_TYPE@
-OnDemand=False
+OnDemand=True
 Configurable=True
 Enabled=False
 
 [Addon/Dependencies]
 0=core:@REQUIRED_FCITX_VERSION@
-
-[Addon/OptionalDependencies]
-0=pinyin
+1=chinese-llm-punctuation
+2=chinese-llm-fullwidth
+3=chinese-llm-chttrans
+4=chinese-llm-pinyinhelper

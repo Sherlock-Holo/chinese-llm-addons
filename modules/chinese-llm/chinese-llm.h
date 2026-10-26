@@ -24,6 +24,7 @@
 #include <fcitx/addoninstance.h>
 #include <fcitx/addonmanager.h>
 #include <fcitx/inputcontextproperty.h>
+#include <fcitx/inputmethodengine.h>
 #include <fcitx/instance.h>
 #include <memory>
 #include <string>
@@ -34,6 +35,9 @@ namespace fcitx::chinesellm {
 
 FCITX_CONFIGURATION(
     ChineseLlmConfig,
+    fcitx::SubConfigOption nativePinyin{
+        this, "NativePinyin", _("Independent Pinyin Settings"),
+        "fcitx://config/addon/chinese-llm/pinyin"};
     fcitx::Option<bool> enabled{this, "Enabled", _("Enable LLM candidates"),
                                 true};
     fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation> endpoint{
@@ -84,9 +88,6 @@ FCITX_CONFIGURATION(
         fcitx::IntConstrain(10, 3600)};
     fcitx::Option<bool> showBadge{this, "ShowBadge", _("Mark LLM candidates"),
                                   true};
-    fcitx::Option<bool> skipShuangpin{
-        this, "SkipShuangpin",
-        _("Skip shuangpin (the model expects full pinyin)"), true};
     fcitx::Option<fcitx::KeyList> toggleKey{
         this,
         "ToggleKey",
@@ -134,7 +135,9 @@ struct LlmState : public fcitx::InputContextProperty {
     uint64_t generation = 0;
 };
 
-class ChineseLlm : public fcitx::AddonInstance,
+// A separate input method with a privately compiled native pinyin engine.
+// Both native settings/learning and LLM configuration belong to this addon.
+class ChineseLlm : public fcitx::InputMethodEngineV4,
                    public fcitx::TrackableObject<ChineseLlm> {
 public:
     ChineseLlm(fcitx::AddonManager *manager);
@@ -144,6 +147,33 @@ public:
     const fcitx::Configuration *getConfig() const override { return &config_; }
     void setConfig(const fcitx::RawConfig &config) override;
     void save() override;
+    const fcitx::Configuration *
+    getSubConfig(const std::string &path) const override;
+    void setSubConfig(const std::string &path,
+                      const fcitx::RawConfig &config) override;
+
+    // Engine events are forwarded to our owned native engine, never to the
+    // distribution's pinyin addon.
+    void keyEvent(const fcitx::InputMethodEntry &entry,
+                  fcitx::KeyEvent &event) override;
+    void activate(const fcitx::InputMethodEntry &entry,
+                  fcitx::InputContextEvent &event) override;
+    void deactivate(const fcitx::InputMethodEntry &entry,
+                    fcitx::InputContextEvent &event) override;
+    void reset(const fcitx::InputMethodEntry &entry,
+               fcitx::InputContextEvent &event) override;
+    void filterKey(const fcitx::InputMethodEntry &entry,
+                   fcitx::KeyEvent &event) override;
+    std::string subMode(const fcitx::InputMethodEntry &entry,
+                        fcitx::InputContext &ic) override;
+    std::string subModeIconImpl(const fcitx::InputMethodEntry &entry,
+                                fcitx::InputContext &ic) override;
+    std::string subModeLabelImpl(const fcitx::InputMethodEntry &entry,
+                                 fcitx::InputContext &ic) override;
+    void invokeActionImpl(const fcitx::InputMethodEntry &entry,
+                          fcitx::InvokeActionEvent &event) override;
+    void virtualKeyboardEventImpl(const fcitx::InputMethodEntry &entry,
+                                  fcitx::VirtualKeyboardEvent &event) override;
 
     /// Exposed for tests.
     LlmState *stateFor(fcitx::InputContext *ic) {
@@ -160,6 +190,7 @@ private:
     static std::string cacheKey(const std::string &pinyin,
                                 const std::string &context);
 
+    bool isLlmInputMethod(fcitx::InputContext *ic) const;
     /// Whether this input context is one we should generate candidates for.
     /// Not const: an expired cooldown is cleared as a side effect of asking.
     bool isEligible(fcitx::InputContext *ic);
@@ -186,6 +217,11 @@ private:
 
     BackendConfig backendConfig() const;
 
+    // Owned by this addon, with independent config, dictionaries and history.
+    // The official pinyin addon can be absent or disabled.
+    std::unique_ptr<fcitx::InputMethodEngine> pinyin_;
+    const fcitx::InputMethodEntry pinyinEntry_{"llm-pinyin", "LLM拼音", "zh_CN",
+                                               "chinese-llm"};
     std::unique_ptr<LlmWorker> worker_;
     fcitx::Instance *instance_;
     fcitx::EventDispatcher &dispatcher_;
