@@ -17,8 +17,10 @@
 #include <fcitx/inputcontext.h>
 #include <fcitx/inputmethodentry.h>
 #include <fcitx/inputpanel.h>
+#include <fcitx/statusarea.h>
 #include <fcitx/text.h>
 #include <fcitx/userinterface.h>
+#include <fcitx/userinterfacemanager.h>
 #include <functional>
 #include <string>
 #include <utility>
@@ -33,9 +35,11 @@ namespace {
 FCITX_DEFINE_LOG_CATEGORY(chinesellm, "chinese-llm");
 
 constexpr char kEnvApiKey[] = "FCITX_CHINESE_LLM_API_KEY";
-/// Suffix appended to a candidate's comment so the user can tell model output
-/// from dictionary output at a glance.
-constexpr char kBadge[] = "LLM";
+/// Kimpanel flattens textWithComment() into the candidate's display string.
+/// Keep semantic text untouched for deduplication and commit, and request a
+/// monochrome cloud (U+2601 U+FE0E), not a colored emoji, in its display
+/// comment.
+constexpr char kBadge[] = "\u2601\uFE0E";
 
 /**
  * A candidate backed by model output.
@@ -56,6 +60,7 @@ public:
         if (badge) {
             fcitx::Text comment(kBadge);
             setComment(comment);
+            setSpaceBetweenComment(true);
         }
     }
 
@@ -82,6 +87,19 @@ ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
       dispatcher_(manager->instance()->eventDispatcher()) {
     instance_->inputContextManager().registerProperty("chinese-llm", &factory_);
 
+    toggleAction_.setCheckable(true);
+    toggleAction_.registerAction("chinese-llm-toggle",
+                                 &instance_->userInterfaceManager());
+    toggleConnection_ = toggleAction_.connect<SimpleAction::Activated>(
+        [this](InputContext *ic) {
+            // Kimpanel targets the most recent IC; opening its shell menu may
+            // temporarily move keyboard focus away. Gate ownership, not focus.
+            // Ignore stale menu clicks after switching away from our entry.
+            if (ic && isLlmInputMethod(ic) &&
+                ic->statusArea().isChild(&toggleAction_)) {
+                toggle();
+            }
+        });
     reloadConfig();
 
     // Fired by the pinyin engine after it has rebuilt the candidate list, so
@@ -119,6 +137,7 @@ ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
 }
 
 ChineseLlm::~ChineseLlm() {
+    toggleConnection_.disconnect();
     eventWatchers_.clear();
     invalidateAll();
     worker_->stop();
@@ -132,6 +151,8 @@ void ChineseLlm::activate(const InputMethodEntry &, InputContextEvent &event) {
     auto *ic = event.inputContext();
     invalidateState(ic, ic->propertyFor(&factory_));
     pinyin_->activate(pinyinEntry_, event);
+    ic->statusArea().addAction(StatusGroup::InputMethod, &toggleAction_);
+    toggleAction_.update(ic);
 }
 
 void ChineseLlm::deactivate(const InputMethodEntry &,
@@ -140,6 +161,9 @@ void ChineseLlm::deactivate(const InputMethodEntry &,
     // Remove AI candidates before native deactivation handles commit/clear.
     invalidateState(ic, ic->propertyFor(&factory_));
     pinyin_->deactivate(pinyinEntry_, event);
+    // Retain the selected IM's action across transient focus loss (shell
+    // menus). Fcitx clears the InputMethod status group before activating
+    // another IM.
 }
 
 void ChineseLlm::reset(const InputMethodEntry &, InputContextEvent &event) {
@@ -163,7 +187,8 @@ std::string ChineseLlm::subModeIconImpl(const InputMethodEntry &,
 
 std::string ChineseLlm::subModeLabelImpl(const InputMethodEntry &,
                                          InputContext &) {
-    return "LLM";
+    // GNOME Kimpanel truncates ASCII labels to two characters.
+    return config_.enabled.value() ? "AI" : "PY";
 }
 
 void ChineseLlm::invokeActionImpl(const InputMethodEntry &,
@@ -184,6 +209,7 @@ void ChineseLlm::reloadConfig() {
     cacheOrder_.clear();
     errorCount_ = 0;
     cooldownUntil_ = {};
+    refreshStatus();
 }
 
 void ChineseLlm::setConfig(const fcitx::RawConfig &config) {
@@ -194,6 +220,7 @@ void ChineseLlm::setConfig(const fcitx::RawConfig &config) {
     cacheOrder_.clear();
     errorCount_ = 0;
     cooldownUntil_ = {};
+    refreshStatus();
 }
 
 void ChineseLlm::save() {
@@ -600,8 +627,33 @@ void ChineseLlm::toggle() {
     invalidateAll();
     errorCount_ = 0;
     cooldownUntil_ = {};
+    refreshStatus();
     FCITX_INFO() << "chinese-llm: "
                  << (config_.enabled.value() ? "enabled" : "disabled");
+}
+
+void ChineseLlm::refreshStatus() {
+    const bool enabled = config_.enabled.value();
+    // Kimpanel does not serialize checked state, so spell out the switch state
+    // in the visible short text as well. Avoid ASCII ':' (protocol delimiter).
+    toggleAction_.setShortText(
+        enabled ? D_("chinese-llm", "LLM candidates enabled")
+                : D_("chinese-llm", "LLM candidates disabled"));
+    toggleAction_.setLongText(
+        D_("chinese-llm",
+           "Click or use the toggle shortcut to enable or disable LLM "
+           "candidates. Native pinyin remains available when disabled."));
+    toggleAction_.setIcon(enabled ? "weather-overcast" : "media-playback-stop");
+    toggleAction_.setChecked(enabled);
+    toggleAction_.setHotkey(config_.toggleKey.value());
+    instance_->inputContextManager().foreach([this](InputContext *ic) {
+        if (isLlmInputMethod(ic) && ic->statusArea().isChild(&toggleAction_)) {
+            // StatusArea refresh also republishes the AI/PY input method label.
+            // Do not rebuild GNOME's status menu on every keystroke.
+            toggleAction_.update(ic);
+        }
+        return true;
+    });
 }
 
 void ChineseLlm::noteError(const std::string &error) {

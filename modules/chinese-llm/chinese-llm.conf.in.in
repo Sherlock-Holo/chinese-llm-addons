@@ -1,6 +1,7 @@
 [Addon]
 Name=LLM拼音
 Comment=Independent LLM enhanced pinyin input method via an OpenAI compatible endpoint
+Comment[zh_CN]=通过兼容 OpenAI 的接口提供 LLM 候选词的独立拼音输入法
 Category=InputMethod
 Version=@PROJECT_VERSION@
 Library=libchinese-llm

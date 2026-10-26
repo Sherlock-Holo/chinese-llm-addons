@@ -271,7 +271,10 @@ int main(int argc, char **argv) {
                                              "learning-isolation",
                                              "learning-reload",
                                              "private-actions",
-                                             "native-description"};
+                                             "native-description",
+                                             "cloud-badge",
+                                             "badge-off",
+                                             "llm-status"};
     if (std::ranges::find(scenarios, scenario) == scenarios.end()) {
         std::cerr << "unknown scenario: " << scenario << '\n';
         return EXIT_FAILURE;
@@ -507,6 +510,10 @@ int main(int argc, char **argv) {
                                    scenario == "native-description"
                                ? "False"
                                : "True");
+            config.setValueByPath("ShowBadge",
+                                  scenario == "badge-off" ? "False" : "True");
+            config.setValueByPath("CandidateIndex",
+                                  scenario == "cloud-badge" ? "1" : "2");
             config.setValueByPath("Model", "mock");
             config.setValueByPath("ApiKey", "");
             config.setValueByPath("DebounceMs", "250");
@@ -593,6 +600,107 @@ int main(int argc, char **argv) {
                         instance.inputMethod(ic) == initialInputMethod,
                     "requested input method is not active: " +
                         initialInputMethod);
+            if (scenario == "llm-status") {
+                auto *action = instance.userInterfaceManager().lookupAction(
+                    "chinese-llm-toggle");
+                require(action && action->isCheckable() &&
+                            ic->statusArea().isChild(action),
+                        "LLM toggle action is not visible in its status menu");
+                int statusUpdates = 0;
+                auto statusWatcher = instance.watchEvent(
+                    EventType::InputContextUpdateUI, EventWatcherPhase::Default,
+                    [&](Event &event) {
+                        auto &update =
+                            static_cast<InputContextUpdateUIEvent &>(event);
+                        if (update.inputContext() == ic &&
+                            update.component() ==
+                                UserInterfaceComponent::StatusArea) {
+                            ++statusUpdates;
+                        }
+                    });
+                auto checkStatus = [&](bool enabled) {
+                    const auto label = action->shortText(ic);
+                    require(configValue(llm->getConfig(), "Enabled") ==
+                                    (enabled ? "True" : "False") &&
+                                action->isChecked(ic) == enabled &&
+                                (enabled
+                                     ? (label == "LLM candidates enabled" ||
+                                        label == "LLM 候选词已启用")
+                                     : (label == "LLM candidates disabled" ||
+                                        label == "LLM 候选词已停用")) &&
+                                llmEngine->subModeLabel(*entry, *ic) ==
+                                    (enabled ? "AI" : "PY"),
+                            "menu, checkbox, top-bar label and configuration "
+                            "disagree");
+                    require(label.find(':') == std::string::npos &&
+                                action->longText(ic).find(':') ==
+                                    std::string::npos,
+                            "LLM status fields contain Kimpanel protocol "
+                            "delimiter");
+                };
+                checkStatus(true);
+                action->activate(ic);
+                checkStatus(false);
+                require(statusUpdates > 0,
+                        "menu toggle did not request StatusArea refresh");
+                llm->reloadConfig();
+                checkStatus(false);
+                const int beforeKey = statusUpdates;
+                require(frontend->call<ITestFrontend::sendKeyEvent>(
+                            uuid, Key("Control+Alt+Shift+L"), false),
+                        "LLM toggle key was not accepted");
+                checkStatus(true);
+                require(statusUpdates > beforeKey,
+                        "keyboard toggle did not refresh Kimpanel state");
+                RawConfig change;
+                change.setValueByPath("Enabled", "False");
+                change.setValueByPath("ToggleKey/0", "Control+Alt+Shift+K");
+                const int beforeConfig = statusUpdates;
+                llm->setConfig(change);
+                checkStatus(false);
+                require(statusUpdates > beforeConfig &&
+                            Key("Control+Alt+Shift+K")
+                                .checkKeyList(action->hotkey()),
+                        "GUI config did not update status/hotkey metadata");
+                frontend->call<ITestFrontend::sendKeyEvent>(
+                    uuid, Key("Control+Alt+Shift+L"), false);
+                checkStatus(false);
+                frontend->call<ITestFrontend::sendKeyEvent>(
+                    uuid, Key("Control+Alt+Shift+K"), false);
+                checkStatus(true);
+                ic->focusOut();
+                // GNOME shell menus can transiently take keyboard focus. The
+                // selected IM's action must still work on the most recent IC.
+                require(ic->statusArea().isChild(action),
+                        "LLM menu action vanished during transient focus loss");
+                action->activate(ic);
+                checkStatus(false);
+                action->activate(ic);
+                checkStatus(true);
+                const auto beforeStaleClick = configSnapshot(llm->getConfig());
+                action->activate(nullptr);
+                require(configSnapshot(llm->getConfig()) == beforeStaleClick,
+                        "null menu click toggled LLM");
+                ic->focusIn();
+                for (const auto *nativeEntry :
+                     {officialEntry, shuangpinEntry}) {
+                    instance.setCurrentInputMethod(
+                        ic, nativeEntry->uniqueName(), true);
+                    require(
+                        !ic->statusArea().isChild(action),
+                        "LLM toggle action leaked into official input method");
+                    action->activate(ic);
+                    require(
+                        configSnapshot(llm->getConfig()) == beforeStaleClick,
+                        "stale LLM action toggled from official input method");
+                }
+                instance.setCurrentInputMethod(ic, kLlmInputMethod, true);
+                require(ic->statusArea().isChild(action),
+                        "LLM action was not restored after switching back");
+                checkStatus(true);
+                finish(true, "");
+                return;
+            }
             if (scenario == "native-description") {
                 checkNativeDescription(llm);
                 require(ic->property("chinese-llm-pinyinState"),
@@ -1369,6 +1477,83 @@ int main(int argc, char **argv) {
                                     "modifier selection left old native "
                                     "composition");
                             ic->reset();
+                            finish(true, "");
+                        } else if ((scenario == "cloud-badge" ||
+                                    scenario == "badge-off") &&
+                                   appeared) {
+                            const bool badge = scenario == "cloud-badge";
+                            auto checkBadge = [&]() {
+                                auto list = ic->inputPanel().candidateList();
+                                auto *bulk = list ? list->toBulk() : nullptr;
+                                require(
+                                    bulk,
+                                    "LLM result has no bulk candidate list");
+                                int matches = 0;
+                                for (int i = 0; i < bulk->totalSize(); ++i) {
+                                    const auto &word =
+                                        bulk->candidateFromAll(i);
+                                    if (word.text().toString() == kModelWord) {
+                                        ++matches;
+                                        require(
+                                            word.comment().toString() ==
+                                                (badge ? "\u2601\uFE0E" : ""),
+                                            "cloud marker visibility is wrong");
+                                        const auto displayed =
+                                            instance
+                                                .outputFilter(
+                                                    ic,
+                                                    word.textWithComment(
+                                                        word.spaceBetweenComment()
+                                                            ? " "
+                                                            : ""))
+                                                .toString();
+                                        require(displayed ==
+                                                    std::string(kModelWord) +
+                                                        (badge ? " \u2601\uFE0E"
+                                                               : ""),
+                                                "Kimpanel candidate payload "
+                                                "lost/duplicated cloud marker");
+                                    }
+                                    if (word.text().toString() ==
+                                        "他们正在开会") {
+                                        require(word.comment().toString().find(
+                                                    "\u2601") ==
+                                                    std::string::npos,
+                                                "native dictionary candidate "
+                                                "was falsely marked as LLM");
+                                    }
+                                }
+                                require(matches == 1,
+                                        "LLM UI refresh duplicated semantic "
+                                        "candidate");
+                                if (badge) {
+                                    require(
+                                        list->candidate(0).text().toString() ==
+                                            kModelWord,
+                                        "1-based CandidateIndex=1 did not put "
+                                        "model result first");
+                                }
+                            };
+                            checkBadge();
+                            ic->updateUserInterface(
+                                UserInterfaceComponent::InputPanel);
+                            checkBadge();
+                            if (badge) {
+                                frontend->call<
+                                    ITestFrontend::pushCommitExpectation>(
+                                    kModelWord);
+                                require(
+                                    frontend->call<ITestFrontend::sendKeyEvent>(
+                                        uuid, Key("space"), false),
+                                    "first LLM candidate was not selected by "
+                                    "Space");
+                                require(preeditText(ic).empty() &&
+                                            state()->pinyin.empty(),
+                                        "cloud candidate commit left "
+                                        "composition behind");
+                            } else {
+                                checkCommit(kModelWord);
+                            }
                             finish(true, "");
                         } else if (appeared) {
                             checkCommit(kModelWord);

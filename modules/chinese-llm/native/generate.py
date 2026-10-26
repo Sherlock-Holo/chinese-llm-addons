@@ -233,6 +233,10 @@ def helper(text, module, file):
         if old in text:
             text = replace_present(text, old, new, file)
     if file.endswith(".cpp"):
+        # Factory binding must not claim the official addon's gettext domain.
+        if module in ("fullwidth", "chttrans", "pinyinhelper") and file.endswith(module + ".cpp"):
+            text = replace(text, 'registerDomain("fcitx5-chinese-addons", FCITX_INSTALL_LOCALEDIR)',
+                           'registerDomain("chinese-llm", FCITX_INSTALL_LOCALEDIR)', file)
         factories = {"punctuation": "PunctuationFactory", "fullwidth": "FullwidthModuleFactory",
                      "chttrans": "ChttransModuleFactory", "pinyinhelper": "PinyinHelperModuleFactory"}
         factory = factories[module]
@@ -242,6 +246,9 @@ def helper(text, module, file):
     if module in ("punctuation", "fullwidth") and file.endswith(".h"):
         text = replace(text, 'void setEnabled(bool enabled, fcitx::InputContext *ic) {',
             'void setEnabled(bool enabled, fcitx::InputContext *ic) {\n        if (!inWhiteList(ic)) { return; }', file)
+    if module == "punctuation" and file.endswith("punctuation.h"):
+        text = replace(text, 'return new Punctuation(manager->instance());',
+            'registerDomain("chinese-llm", FCITX_INSTALL_LOCALEDIR);\n        return new Punctuation(manager->instance());', file)
     if module == "punctuation" and file.endswith("punctuation.cpp"):
         text = replace(text,
             'return toggleAction_.isParent(&inputContext->statusArea());',

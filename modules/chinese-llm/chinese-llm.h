@@ -19,7 +19,9 @@
 #include <fcitx-utils/i18n.h>
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/misc.h>
+#include <fcitx-utils/signals.h>
 #include <fcitx-utils/trackableobject.h>
+#include <fcitx/action.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addoninstance.h>
 #include <fcitx/addonmanager.h>
@@ -36,85 +38,101 @@ namespace fcitx::chinesellm {
 FCITX_CONFIGURATION(
     ChineseLlmConfig,
     fcitx::SubConfigOption nativePinyin{
-        this, "NativePinyin", _("Independent Pinyin Settings"),
+        this, "NativePinyin", D_("chinese-llm", "Independent Pinyin Settings"),
         "fcitx://config/addon/chinese-llm/pinyin"};
-    fcitx::Option<bool> enabled{this, "Enabled", _("Enable LLM candidates"),
-                                true};
+    fcitx::Option<bool> enabled{
+        this, "Enabled", D_("chinese-llm", "Enable LLM candidates"), true};
     fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation> endpoint{
         this,
         "Endpoint",
-        _("Endpoint"),
+        D_("chinese-llm", "Endpoint"),
         "http://127.0.0.1:11434/v1/chat/completions",
         {},
         {},
-        {_("An OpenAI compatible chat completions URL. Works with ollama, "
-           "llama.cpp's llama-server, and hosted compatible APIs.")}};
-    fcitx::Option<std::string> model{this, "Model", _("Model"), "qwen3:0.6b"};
+        {D_("chinese-llm",
+            "An OpenAI compatible chat completions URL. Works with ollama, "
+            "llama.cpp's llama-server, and hosted compatible APIs.")}};
+    fcitx::Option<std::string> model{this, "Model", D_("chinese-llm", "Model"),
+                                     "qwen3:0.6b"};
     fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation> apiKey{
         this,
         "ApiKey",
-        _("API Key"),
+        D_("chinese-llm", "API Key"),
         "",
         {},
         {},
-        {_("Sent as a bearer token. Leave empty for a local server that does "
-           "not authenticate. Falls back to the environment variable "
-           "FCITX_CHINESE_LLM_API_KEY when empty.")}};
+        {D_("chinese-llm",
+            "Sent as a bearer token. Leave empty for a local server that does "
+            "not authenticate. Falls back to the environment variable "
+            "FCITX_CHINESE_LLM_API_KEY when empty.")}};
     fcitx::Option<int, fcitx::IntConstrain> minPinyinLength{
-        this, "MinPinyinLength", _("Minimum Pinyin Length"), 4,
+        this, "MinPinyinLength", D_("chinese-llm", "Minimum Pinyin Length"), 4,
         fcitx::IntConstrain(1, 40)};
     fcitx::Option<int, fcitx::IntConstrain> debounceMs{
-        this, "DebounceMs", _("Debounce Delay (ms)"), 250,
+        this, "DebounceMs", D_("chinese-llm", "Debounce Delay (ms)"), 250,
         fcitx::IntConstrain(0, 2000)};
     fcitx::Option<int, fcitx::IntConstrain> timeoutSeconds{
-        this, "TimeoutSeconds", _("Request Timeout (seconds)"), 5,
-        fcitx::IntConstrain(1, 30)};
+        this, "TimeoutSeconds", D_("chinese-llm", "Request Timeout (seconds)"),
+        5, fcitx::IntConstrain(1, 30)};
     fcitx::Option<int, fcitx::IntConstrain> maxCandidates{
-        this, "MaxCandidates", _("Max Candidates"), 3,
+        this, "MaxCandidates", D_("chinese-llm", "Max Candidates"), 3,
         fcitx::IntConstrain(1, 5)};
     fcitx::Option<int, fcitx::IntConstrain> candidateIndex{
-        this, "CandidateIndex", _("Candidate Position"), 2,
+        this, "CandidateIndex", D_("chinese-llm", "Candidate Position"), 2,
         fcitx::IntConstrain(1, 10)};
     fcitx::Option<int, fcitx::IntConstrain> contextLength{
-        this, "ContextLength", _("Context Length (characters)"), 64,
-        fcitx::IntConstrain(0, 256)};
+        this, "ContextLength", D_("chinese-llm", "Context Length (characters)"),
+        64, fcitx::IntConstrain(0, 256)};
     fcitx::Option<int, fcitx::IntConstrain> cacheSize{
-        this, "CacheSize", _("Cache Size"), 256, fcitx::IntConstrain(0, 4096)};
+        this, "CacheSize", D_("chinese-llm", "Cache Size"), 256,
+        fcitx::IntConstrain(0, 4096)};
     fcitx::Option<int, fcitx::IntConstrain> maxConsecutiveErrors{
-        this, "MaxConsecutiveErrors", _("Errors Before Cooldown"), 5,
+        this, "MaxConsecutiveErrors",
+        D_("chinese-llm", "Errors Before Cooldown"), 5,
         fcitx::IntConstrain(1, 50)};
     fcitx::Option<int, fcitx::IntConstrain> cooldownSeconds{
-        this, "CooldownSeconds", _("Cooldown (seconds)"), 120,
+        this, "CooldownSeconds", D_("chinese-llm", "Cooldown (seconds)"), 120,
         fcitx::IntConstrain(10, 3600)};
-    fcitx::Option<bool> showBadge{this, "ShowBadge", _("Mark LLM candidates"),
-                                  true};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> showBadge{
+        this,
+        "ShowBadge",
+        D_("chinese-llm", "Show cloud marker on LLM candidates"),
+        true,
+        {},
+        {},
+        {D_("chinese-llm",
+            "Display a cloud symbol beside LLM-generated candidates. "
+            "The symbol is not committed as text. Dictionary "
+            "candidates are not marked, including duplicate model results.")}};
     fcitx::Option<fcitx::KeyList> toggleKey{
         this,
         "ToggleKey",
-        _("Toggle Key"),
+        D_("chinese-llm", "Toggle Key"),
         {fcitx::Key("Control+Alt+Shift+L")}};
     fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation>
         systemPrompt{
             this,
             "SystemPrompt",
-            _("System Prompt"),
+            D_("chinese-llm", "System Prompt"),
             "You are a Chinese pinyin input method. Convert the pinyin keys "
             "into the most likely Chinese sentence, using the context to "
             "disambiguate. Output only the Chinese characters on a single "
             "line. No pinyin, no explanation, no quotes.",
             {},
             {},
-            {_("Keep this short and unambiguous. The model must answer with "
-               "Han characters only, otherwise its output is discarded.")}};
+            {D_("chinese-llm",
+                "Keep this short and unambiguous. The model must answer with "
+                "Han characters only, otherwise its output is discarded.")}};
     fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation>
         promptTemplate{this,
                        "PromptTemplate",
-                       _("Prompt Template"),
+                       D_("chinese-llm", "Prompt Template"),
                        "{context}\n{pinyin}",
                        {},
                        {},
-                       {_("{context} is replaced with the recently committed "
-                          "text, {pinyin} with the keys being typed.")}};);
+                       {D_("chinese-llm",
+                           "{context} is replaced with the recently committed "
+                           "text, {pinyin} with the keys being typed.")}};);
 
 /// Per input context state. The candidate list is rebuilt from scratch on
 /// every keystroke, so everything that must survive a rebuild lives here.
@@ -207,6 +225,7 @@ private:
     void insertCandidates(fcitx::InputContext *ic, LlmState *state,
                           const std::vector<std::string> &candidates);
     void toggle();
+    void refreshStatus();
 
     void noteError(const std::string &error);
     bool inCooldown() const;
@@ -228,6 +247,8 @@ private:
     fcitx::FactoryFor<LlmState> factory_{
         [](fcitx::InputContext &) { return new LlmState; }};
     ChineseLlmConfig config_;
+    fcitx::SimpleAction toggleAction_;
+    fcitx::ScopedConnection toggleConnection_;
     std::vector<std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>>
         eventWatchers_;
 
@@ -243,6 +264,8 @@ private:
 class ChineseLlmFactory : public fcitx::AddonFactory {
 public:
     fcitx::AddonInstance *create(fcitx::AddonManager *manager) override {
+        // Bind before constructing either native or LLM configuration labels.
+        fcitx::registerDomain("chinese-llm", FCITX_INSTALL_LOCALEDIR);
         return new ChineseLlm(manager);
     }
 };

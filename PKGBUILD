@@ -2,14 +2,14 @@
 # Run makepkg from this checkout, or set CHINESE_LLM_SOURCE_DIR to it.
 # prepare() includes uncommitted source files in a fresh, isolated snapshot.
 pkgname=chinese-llm-addons
-pkgver=5.1.15.local.hfca4b0e9128fe3bc
+pkgver=5.1.15.local.h83c59f208b00cf81
 pkgrel=1
 pkgdesc='Independent LLM Pinyin input method for Fcitx5 (keeps official Chinese addons)'
 arch=('x86_64')
 url='https://github.com/Sherlock-Holo/chinese-llm-addons'
 license=('LGPL-2.1-or-later')
 depends=('fcitx5>=5.1.22' 'libime>=1.1.14' 'curl' 'gcc-libs' 'glibc')
-makedepends=('cmake>=3.12' 'ninja' 'nlohmann-json' 'pkgconf' 'boost' 'python>=3.8')
+makedepends=('cmake>=3.12' 'ninja' 'nlohmann-json' 'pkgconf' 'boost' 'python>=3.8' 'gettext')
 options=('!debug')
 # No provides/conflicts/replaces for fcitx5-chinese-addons or fcitx.
 # This recipe intentionally packages local sources, not an obsolete remote pin.
@@ -42,6 +42,7 @@ prepare() {
     test/testllmaddon.cpp scripts/smoke.sh scripts/mock_server.py \
     modules/chinese-llm/native/CMakeLists.txt modules/chinese-llm/native/generate.py \
     modules/chinese-llm/native/reviewed-sources.json \
+    modules/chinese-llm/po/CMakeLists.txt modules/chinese-llm/po/zh_CN.po po/zh_CN.po \
     modules/chinese-llm/native/data/py_stroke.mb modules/chinese-llm/native/data/py_table.mb \
     im/pinyin/pinyin.cpp im/pinyin/pinyin.h im/pinyin/chaizi.txt im/pinyin/symbols \
     im/pinyin/sp.dat.example modules/cloudpinyin/cloudpinyin_public.h \
@@ -78,6 +79,7 @@ prepare() {
       modules/chinese-llm/CMakeLists.txt modules/chinese-llm/*.cpp
       modules/chinese-llm/*.h modules/chinese-llm/*.in
       modules/chinese-llm/*.in.in modules/chinese-llm/*.conf
+      modules/chinese-llm/po/CMakeLists.txt modules/chinese-llm/po/*.po po/zh_CN.po
       test/CMakeLists.txt test/testdir.h.in test/testllm*.cpp
       test/addon/CMakeLists.txt scripts/*.sh scripts/*.py
       modules/chinese-llm/native/CMakeLists.txt modules/chinese-llm/native/*.py
@@ -150,13 +152,13 @@ check() {
   _snapshot_root || return 1
   # Deterministic, network-free tests; no real model or user's Fcitx session.
   ctest --test-dir "$_snapshot/build" --output-on-failure \
-    -R '^testllm(backend|config)$'
+    -R '^testllm(backend|config|config-zh_CN|config-en)$'
 }
 
 package() {
   _snapshot_root || return 1
   # Stage into the package, never into the running system. The component is an
-  # additional safeguard even in LLM-only mode; it must install exactly 20 files.
+  # additional safeguard even in LLM-only mode; it must install exactly 21 files.
   DESTDIR="${pkgdir:?}" cmake --install "$_snapshot/build" --component chinese-llm || return 1
   (
     shopt -s globstar nullglob dotglob
@@ -172,7 +174,8 @@ package() {
         usr/lib/fcitx5/libchinese-llm-pinyinhelper.so|usr/share/fcitx5/addon/chinese-llm-pinyinhelper.conf|\
         usr/share/fcitx5/chinese-llm/symbols|usr/share/fcitx5/chinese-llm/sp.dat.example|usr/share/fcitx5/chinese-llm/chaizi.dict|\
         usr/share/fcitx5/chinese-llm/punctuation/punc.mb.zh_CN|usr/share/fcitx5/chinese-llm/punctuation/punc.mb.zh_HK|usr/share/fcitx5/chinese-llm/punctuation/punc.mb.zh_TW|\
-        usr/share/fcitx5/chinese-llm/chttrans/gbks2t.tab|usr/share/fcitx5/chinese-llm/pinyinhelper/py_stroke.mb|usr/share/fcitx5/chinese-llm/pinyinhelper/py_table.mb)
+        usr/share/fcitx5/chinese-llm/chttrans/gbks2t.tab|usr/share/fcitx5/chinese-llm/pinyinhelper/py_stroke.mb|usr/share/fcitx5/chinese-llm/pinyinhelper/py_table.mb|\
+        usr/share/locale/zh_CN/LC_MESSAGES/chinese-llm.mo)
           if [[ ! -f "$path" || -L "$path" ]]; then
             printf 'error: expected a regular package file: %s\n' "$relative" >&2
             exit 1
@@ -185,8 +188,8 @@ package() {
           ;;
       esac
     done
-    if [[ "$count" -ne 20 ]]; then
-      printf 'error: expected exactly twenty private LLM input-method files, found %s\n' "$count" >&2
+    if [[ "$count" -ne 21 ]]; then
+      printf 'error: expected exactly twenty-one private LLM input-method files, found %s\n' "$count" >&2
       exit 1
     fi
   ) || return 1

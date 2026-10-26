@@ -31,7 +31,11 @@ add_test(NAME testllmbackend COMMAND testllmbackend)
 add_executable(testllmconfig testllmconfig.cpp)
 target_include_directories(testllmconfig PRIVATE ${PROJECT_SOURCE_DIR}/modules/chinese-llm)
 target_link_libraries(testllmconfig Fcitx5::Core Fcitx5::Config PkgConfig::Curl nlohmann_json::nlohmann_json)
+add_dependencies(testllmconfig chinese-llm-translation)
 add_test(NAME testllmconfig COMMAND testllmconfig)
+add_test(NAME testllmconfig-zh_CN COMMAND testllmconfig zh_CN "${CHINESE_LLM_TEST_LOCALE_DIR}")
+set_tests_properties(testllmconfig-zh_CN PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME testllmconfig-en COMMAND testllmconfig en "${CHINESE_LLM_TEST_LOCALE_DIR}")
 
 # Not registered with add_test: this one needs a mock HTTP server on a known
 # port, so it is driven by scripts/smoke.sh instead of ctest.

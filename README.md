@@ -70,9 +70,11 @@ recognize `llm-pinyin`.
 
 The independent build requires a C++20 compiler, CMake, Python3, pkg-config,
 Fcitx5 Core/Config >= 5.1.22 and relevant core module interface headers,
-LibIME Pinyin >= 1.1.14, Boost headers, POSIX threads, libcurl and nlohmann-json >=
-3.2. Tests additionally require Fcitx TestFrontend development files. Qt, gettext,
-ECM, LibIME Table and OpenCC are not required by the LLM-only build.
+LibIME Pinyin >= 1.1.14, Boost headers, POSIX threads, libcurl, nlohmann-json >=
+3.2 and gettext tools (`msgcat`/`msgfmt`). Tests additionally require Fcitx
+TestFrontend development files. The Chinese translation test needs an available
+UTF-8 locale such as `zh_CN.UTF-8` or `en_US.UTF-8`. Qt, ECM, LibIME Table and
+OpenCC are not required by the LLM-only build.
 
 ```sh
 cmake -S . -B build-llm -DENABLE_CHINESE_LLM_ONLY=ON -DENABLE_TEST=OFF \
@@ -92,8 +94,12 @@ LLM-only configure/build path does not download data or a model.
 
 The `chinese-llm` component installs only its library, four private helper
 libraries, their uniquely named metadata, the `llm-pinyin` entry and private
-read-only resources. The package checks an exact file allowlist and refuses
-unexpected upstream addon files, symlinks or auto-enabling the main LLM addon.
+read-only resources, plus the private `chinese-llm` Simplified Chinese translation
+catalog. It includes native pinyin labels as well as all LLM settings/tooltips,
+and never installs or binds the official `fcitx5-chinese-addons` catalog. English
+remains the fallback for other languages. The package checks an exact 21-file
+allowlist and refuses unexpected upstream addon files, symlinks or auto-enabling
+the main LLM addon.
 
 ### Arch Linux
 
@@ -152,6 +158,33 @@ Installing/enabling the addon does not start a model server. Requests require
 LLM拼音 to be active, its own LLM `Enabled=True` and a valid eligible composition.
 A disabled LLM switch or failed model request leaves its private native dictionary
 input fully usable. Switching to original pinyin is always model-free.
+
+### Candidate cloud marker and visible LLM switch
+
+With `ShowBadge=True`, model-generated candidates show a small monochrome cloud
+comment, for example `她们正在开会 ☁︎`. Fcitx Kimpanel sends the candidate's
+`textWithComment()` as plain display text; GNOME Kimpanel displays that string
+without needing an extension patch. The cloud is not committed, cached as model
+text or learned. Its exact appearance depends on the panel font. Turning the
+marker off removes it without disabling LLM requests.
+
+`CandidateIndex=1` inserts model suggestions in the first slot **after a result
+arrives**. A first dictionary candidate is not evidence of model output. Results
+identical to existing dictionary candidates are deduplicated; the dictionary
+entry remains unmarked and retains its native selection/learning behavior.
+
+The LLM input method's status menu now contains **LLM candidates enabled** /
+**LLM candidates disabled** (translated into Chinese). Click it or use the
+configured toggle shortcut to change the same persisted `Enabled` setting.
+Kimpanel does not transmit action checkbox state, so the visible menu text spells
+out the state rather than relying on a checkmark. The GNOME top bar uses `AI`
+when enabled and `PY` when disabled: its label renderer truncates ASCII labels to
+two characters. Config changes, reloads and toggles refresh this status immediately.
+The action appears only in LLM拼音, not original 拼音/双拼.
+
+This is the **configured switch state**, not a server-health or request-progress
+indicator. Short compositions, sensitive fields, failed requests, cooldown and
+candidate deduplication may leave only native candidates even with `AI` enabled.
 
 ## OpenAI-compatible endpoint
 

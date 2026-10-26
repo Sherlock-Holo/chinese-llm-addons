@@ -1,0 +1,91 @@
+# Simplified Chinese translations for the independent LLM Pinyin addon.
+# SPDX-License-Identifier: LGPL-2.1-or-later
+msgid ""
+msgstr ""
+"Project-Id-Version: chinese-llm\n"
+"PO-Revision-Date: 2026-10-26 00:00+0000\n"
+"Last-Translator: Chinese LLM contributors\n"
+"Language-Team: Simplified Chinese\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "Independent Pinyin Settings"
+msgstr "独立拼音设置"
+
+msgid "Enable LLM candidates"
+msgstr "启用 LLM 候选词"
+
+msgid "Endpoint"
+msgstr "接口地址"
+
+msgid "An OpenAI compatible chat completions URL. Works with ollama, llama.cpp's llama-server, and hosted compatible APIs."
+msgstr "兼容 OpenAI 的聊天补全接口地址，支持 Ollama、llama.cpp 的 llama-server 以及兼容的在线 API。"
+
+msgid "Model"
+msgstr "模型"
+
+msgid "API Key"
+msgstr "API 密钥"
+
+msgid "Sent as a bearer token. Leave empty for a local server that does not authenticate. Falls back to the environment variable FCITX_CHINESE_LLM_API_KEY when empty."
+msgstr "以 Bearer 令牌发送。不需要身份验证的本地服务可以留空；留空时会尝试使用环境变量 FCITX_CHINESE_LLM_API_KEY。"
+
+msgid "Minimum Pinyin Length"
+msgstr "最小拼音长度"
+
+msgid "Debounce Delay (ms)"
+msgstr "输入防抖延迟（毫秒）"
+
+msgid "Request Timeout (seconds)"
+msgstr "请求超时时间（秒）"
+
+msgid "Max Candidates"
+msgstr "最大候选词数量"
+
+msgid "Candidate Position"
+msgstr "候选词插入位置"
+
+msgid "Context Length (characters)"
+msgstr "上下文长度（字符）"
+
+msgid "Cache Size"
+msgstr "缓存条目数"
+
+msgid "Errors Before Cooldown"
+msgstr "进入冷却前的连续错误次数"
+
+msgid "Cooldown (seconds)"
+msgstr "冷却时间（秒）"
+
+msgid "Show cloud marker on LLM candidates"
+msgstr "在 LLM 候选词旁显示云朵标记"
+
+msgid "Display a cloud symbol beside LLM-generated candidates. The symbol is not committed as text. Dictionary candidates are not marked, including duplicate model results."
+msgstr "在 LLM 生成的候选词旁显示云朵符号，符号不会输入到正文。词库候选词不会标记，包括与模型结果重复的词库候选词。"
+
+msgid "LLM candidates enabled"
+msgstr "LLM 候选词已启用"
+
+msgid "LLM candidates disabled"
+msgstr "LLM 候选词已停用"
+
+msgid "Click or use the toggle shortcut to enable or disable LLM candidates. Native pinyin remains available when disabled."
+msgstr "点击此项或使用启用／停用快捷键切换 LLM 候选词。停用后仍可使用原生拼音。"
+
+msgid "Toggle Key"
+msgstr "启用／停用快捷键"
+
+msgid "System Prompt"
+msgstr "系统提示词"
+
+msgid "Keep this short and unambiguous. The model must answer with Han characters only, otherwise its output is discarded."
+msgstr "请保持简短且明确。模型必须仅输出汉字，否则输出会被丢弃。"
+
+msgid "Prompt Template"
+msgstr "提示词模板"
+
+msgid "{context} is replaced with the recently committed text, {pinyin} with the keys being typed."
+msgstr "{context} 会替换为最近输入并确认的文本，{pinyin} 会替换为正在输入的拼音。"

@@ -122,7 +122,7 @@ run_checked config 'All config tests passed' "$RUN_DIR/config.log" "$BUILD_DIR/b
 run_checked worker 'All worker tests passed' "$RUN_DIR/worker.log" \
     "$BUILD_DIR/bin/testllmworker" "$BASE/v1/chat/completions"
 
-for scenario in live debounce disabled dead preview reset partial toggle toggle-inflight sensitive sensitive-inflight context cache cooldown config filtered metadata original-pinyin original-shuangpin switch-inflight switch-results own-config virtual-keyboard preedit-click modifier-selection modifier-selection-global llm-alone private-settings customphrase-isolation learning-isolation learning-reload private-actions native-description; do
+for scenario in live debounce disabled dead preview reset partial toggle toggle-inflight sensitive sensitive-inflight context cache cooldown config filtered metadata original-pinyin original-shuangpin switch-inflight switch-results own-config virtual-keyboard preedit-click modifier-selection modifier-selection-global llm-alone private-settings customphrase-isolation learning-isolation learning-reload private-actions native-description cloud-badge badge-off llm-status; do
     scenario_dir="$RUN_DIR/$scenario"
     mkdir -p "$scenario_dir"/{config/conf,data,cache,runtime}
     chmod 700 "$scenario_dir/runtime"
@@ -245,7 +245,8 @@ expected = {"live": 1, "debounce": 1, "disabled": 0, "dead": 0,
             "virtual-keyboard": 1, "preedit-click": 1, "modifier-selection": 1,
             "modifier-selection-global": 1,
             "llm-alone": 1, "private-settings": 0, "customphrase-isolation": 0,
-            "learning-isolation": 0, "learning-reload": 0, "private-actions": 0, "native-description": 0}
+            "learning-isolation": 0, "learning-reload": 0, "private-actions": 0, "native-description": 0,
+             "cloud-badge": 1, "badge-off": 1, "llm-status": 0}
 assert scenario in expected, f"missing request-count assertion for {scenario}"
 assert count == expected[scenario], f"{scenario}: expected {expected[scenario]} POSTs, got {count}"
 if scenario in {"own-config", "metadata", "original-pinyin", "original-shuangpin"}:
