@@ -351,6 +351,114 @@ void reject(SanitizedCandidates &result, std::string_view text,
     }
 }
 
+// Chat models routinely narrate. These helpers recognise narration that would
+// otherwise pass as "mixed text" now that Latin letters are legitimate.
+
+/// Drop reasoning a model may have inlined into the answer: closed
+/// <think>...</think> blocks, an unmatched closing tag (the opening one was
+/// consumed server side) and an unterminated block (the answer never began).
+std::string stripReasoning(std::string_view content) {
+    constexpr std::string_view open = "<think>";
+    constexpr std::string_view close = "</think>";
+    std::string text(content);
+    for (size_t from = 0;;) {
+        const auto start = text.find(open, from);
+        if (start == std::string::npos) {
+            break;
+        }
+        const auto end = text.find(close, start + open.size());
+        if (end == std::string::npos) {
+            text.erase(start);
+            break;
+        }
+        text.erase(start, end + close.size() - start);
+        from = start;
+    }
+    if (const auto end = text.rfind(close); end != std::string::npos) {
+        text.erase(0, end + close.size());
+    }
+    return text;
+}
+
+bool isAsciiDigit(char c) { return c >= '0' && c <= '9'; }
+
+/// "1. x", "2) x", "- x", "* x": an enumerated or bulleted reading.
+bool hasListMarker(std::string_view line) {
+    if (line.size() >= 2 && (line[0] == '-' || line[0] == '*') &&
+        line[1] == ' ') {
+        return true;
+    }
+    if (line.starts_with("\xE2\x80\xA2")) { // U+2022 BULLET
+        return true;
+    }
+    size_t digits = 0;
+    while (digits < line.size() && isAsciiDigit(line[digits])) {
+        ++digits;
+    }
+    if (digits == 0 || digits > 2 || digits + 1 >= line.size()) {
+        return false;
+    }
+    const char marker = line[digits];
+    // "3.14" and "1,000" are numbers, not enumeration.
+    return (marker == '.' || marker == ')') && !isAsciiDigit(line[digits + 1]);
+}
+
+/// "<think>", "</s>", "<br>": markup rather than text to commit.
+bool hasMarkupTag(std::string_view line) {
+    for (size_t i = line.find('<'); i != std::string_view::npos;
+         i = line.find('<', i + 1)) {
+        size_t j = i + 1;
+        if (j < line.size() && line[j] == '/') {
+            ++j;
+        }
+        if (j < line.size() &&
+            ((line[j] >= 'a' && line[j] <= 'z') ||
+             (line[j] >= 'A' && line[j] <= 'Z')) &&
+            line.find('>', j) != std::string_view::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// A line that announces an answer ("Here is the conversion:") instead of
+/// being one.
+bool endsWithColon(std::string_view line) {
+    return line.ends_with(":") || line.ends_with("\xEF\xBC\x9A"); // U+FF1A
+}
+
+/// Remove matching wrappers such as "..." or **...** around mixed text. Only
+/// identical ASCII wrapper bytes at both ends, so "C++" and "it's" survive.
+std::string_view stripWrappers(std::string_view line) {
+    while (line.size() >= 3 &&
+           kNoise.find(line.front()) != std::string_view::npos &&
+           line.front() == line.back()) {
+        line.remove_prefix(1);
+        line.remove_suffix(1);
+        line = trim(line);
+    }
+    return line;
+}
+
+size_t asciiLetters(std::string_view text) {
+    size_t count = 0;
+    for (char c : text) {
+        count += (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    }
+    return count;
+}
+
+size_t latinLetters(std::string_view text) {
+    size_t count = 0;
+    auto iter = text.begin();
+    while (iter != text.end()) {
+        uint32_t c = utf8::INVALID_CHAR;
+        iter = utf8::getNextChar(iter, text.end(), &c);
+        count += isLatinLetter(c);
+    }
+    return count;
+}
+
 std::vector<std::string_view> splitPinyin(std::string_view pinyin) {
     std::vector<std::string_view> out;
     size_t start = 0;
@@ -509,6 +617,11 @@ SanitizedCandidates sanitizeDetailed(std::string_view content,
     std::unordered_set<std::string> seen;
     const size_t expectedLength = countSyllables(pinyin);
     const auto keys = normalizedKeys(pinyin);
+    const size_t keyLetters = asciiLetters(keys);
+    // Reasoning is not an answer; remove it before splitting into lines. The
+    // unmodified reply remains visible in the history viewer.
+    const std::string answer = stripReasoning(content);
+    content = answer;
 
     // Models routinely ignore "single line" and emit several readings. Take
     // each line as a candidate, in the model's own ranking order. Continue past
@@ -544,7 +657,8 @@ SanitizedCandidates sanitizeDetailed(std::string_view content,
         // Preserve English/mixed/emoji punctuation (C++, C#, hello!, *️⃣) and
         // all emoji sequence bytes. Legacy bare-Han results still shed the
         // model's quotes/full stops before their exact syllable check.
-        auto line = text->hasOtherContent ? raw : stripNoise(raw);
+        auto line =
+            text->hasOtherContent ? stripWrappers(raw) : stripNoise(raw);
         while (!line.empty() && line.front() == ' ') {
             line.remove_prefix(1);
         }
@@ -553,6 +667,24 @@ SanitizedCandidates sanitizeDetailed(std::string_view content,
         }
         if (line.empty()) {
             reject(result, raw, "empty_or_punctuation");
+            continue;
+        }
+        // The list marker belongs to the raw line: stripping would otherwise
+        // read the "*" of "* x" as emphasis noise and lose the evidence.
+        if (hasMarkupTag(line) || hasListMarker(trim(raw)) ||
+            endsWithColon(line)) {
+            reject(result, raw, "markup");
+            continue;
+        }
+        // Output cannot outgrow its input: every Han character needs at least
+        // one typed letter, and Latin text is the typed keys (plus a little
+        // slack for completion). A longer answer is narration, not a reading.
+        const size_t length = utf8::lengthValidated(line);
+        if (keyLetters != 0 && (text->hanCount > keyLetters ||
+                                latinLetters(line) > keyLetters + 4 ||
+                                (length != utf8::INVALID_LENGTH &&
+                                 length > keyLetters * 4 + 16))) {
+            reject(result, raw, "too_long");
             continue;
         }
         if (!text->hasOtherContent) {
