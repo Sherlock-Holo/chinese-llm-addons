@@ -246,7 +246,8 @@ hits (clearly marked, with no network latency). Queued and cancelled attempts ar
 not successful model replies. `usable` means the current reply passed the main
 thread's composition/privacy guards; `stale`, `cancelled`, `error`, `empty` and
 `filtered` distinguish the reasons a result did not become a candidate. Filtering
-reasons include invalid text, Han length mismatch, key echo and incomplete replies.
+reasons include invalid text, Han length mismatch, key echo, markup or list
+lines, over-long replies and incomplete replies.
 The aggregate **requests N / valid V** alone cannot distinguish these outcomes.
 Cancellation retains its invalidating event (for example `focus_lost`,
 `input_keys_or_context_changed`, `composition_reset` or
@@ -267,7 +268,9 @@ cleared or evicted entries cannot reappear from late callbacks.
 
 By default no history file exists. Explicit viewing creates a snapshot in a private
 0700 temporary directory with a 0600 file (XDG runtime directory, or a private
-system-temp fallback). After opening, new records/commits update that snapshot.
+system-temp fallback). After opening, new records/commits update that snapshot;
+rewrites are coalesced (about 300 ms) and not synced to disk, so typing never waits
+for file I/O. Refresh the browser tab to see them.
 Clearing history, disabling `RecordHistory`, entering a password/sensitive field
 or unloading the addon clears history and removes the snapshot. An already-open
 browser tab may retain its old view/cache; clear that separately if needed. A crash
@@ -332,8 +335,10 @@ entry currently uses full pinyin; obsolete `SkipShuangpin` keys are ignored.
 
 Requests are asynchronous and debounced. Reset, focus loss, switching input
 methods, privacy changes, model/native configuration changes or toggling off
-invalidate old results. Curl aborts stale transfers, and main-thread delivery and
-selection recheck sequence, generation, composition, privacy and surrounding text.
+invalidate old results. A newer request aborts the transfer in flight immediately
+(the worker is woken, not left to notice at curl's next progress tick, which on a
+slow model is about a second later). Main-thread delivery and selection recheck
+one input snapshot (generation, keys and context), privacy and eligibility.
 Nothing is auto-committed: the user explicitly selects a candidate.
 
 Output validation accepts Chinese/Latin text, numbers and visible emoji, including
@@ -342,13 +347,20 @@ such as `👍🏽` or `👩‍💻`. Spaces and punctuation inside mixed/English
 preserved, as are emoji presentation selectors, skin tones, ZWJ sequences, keycaps
 and regional/subdivision flags. Pure Han results retain the legacy removal of
 model-added edge quotes/punctuation and must still match a known syllable count.
-That one-Han-per-syllable check does **not** apply to Latin/digit/emoji results.
+That one-Han-per-syllable check does **not** apply to Latin/digit/emoji results;
+instead, any result is bounded by the typed keys: it may not contain more Han
+characters than typed letters, nor more Latin letters than typed letters plus four,
+nor more than four times the typed letters plus sixteen characters in total.
+Matching wrapper quotes or `**` emphasis around mixed text are removed.
 Model candidates commit their text directly and do not enter native pinyin learning.
 
 Validation still rejects invalid UTF-8/Unicode scalars, control characters (including
 tabs, NUL and bare CR), bidi controls, unrelated invisible formatting, malformed or
 standalone emoji joiners/selectors/tags, punctuation-only content, oversized replies
-and explicitly incomplete completions. LF separates candidate lines; CRLF is also
+and explicitly incomplete completions. Chat-model narration is not a candidate:
+`<think>…</think>` reasoning is removed from the reply before it is split, and lines
+that contain markup tags, begin with a list marker such as `1.` or `- `, or end in
+a colon (`Here is the conversion:`) are rejected. LF separates candidate lines; CRLF is also
 accepted, but those separators are never committed. Exact input-key echoes are
 rejected after ignoring ASCII case, spaces, apostrophes and model-added edge
 wrappers/punctuation. A pure English output identical to its input keys is ambiguous
@@ -376,16 +388,20 @@ ctest --test-dir build-test --output-on-failure
 
 Smoke additionally needs the Fcitx TestFrontend **runtime** module, Python3,
 curl, Bash and GNU timeout. Original pinyin is needed only for coexistence
-regressions, not for LLM拼音 runtime/standalone cases. The script does not rebuild;
+regressions, not for the LLM-alone case. The script does not rebuild;
 finish building and freeze edits first. It uses isolated profile/config/data/cache
 and its own local mock server, never the user's model endpoint or API token.
 
-Regressions cover parsing, flat INI/schema export, worker cancellation/redirects,
-LLM candidate commit/reset, privacy, preview, cache, cooldown, filtered stale
-selection, virtual keyboard/click actions and modifier-only global-hotkey
-precedence. Independence cases cover private native settings, custom phrases,
-learning save/reload, feature actions and running with the original pinyin
-engine disabled while original user-data sentinels remain unchanged.
+Unit tests cover request parsing, flat INI/schema export, the sanitizer (Han, mixed,
+narration and unsafe input), the worker (redirects, errors, immediate supersede,
+reporting of dropped jobs) and the bounded, escaped history page. Ten real-addon
+scenarios run a full Fcitx instance against the mock server: `live`, `mixed`,
+`mixed-context-changed` (a changed surrounding context retries the final
+composition), `cache`, `sensitive` (no request in password fields), `dead` (no
+endpoint leaves native candidates intact), `toggle`, `history-menu` (private
+snapshot, opener, adoption refresh, clear), `stats-overlap` (native adoption and
+statistics) and `llm-alone` (runs with the original pinyin addon absent while its
+user-data sentinels stay unchanged).
 
 CMake discovers testfrontend's runtime path; override
 `FCITX5_TEST_ADDON_DIR`/`FCITX5_TEST_DATA_DIR` for unusual installations. Test
