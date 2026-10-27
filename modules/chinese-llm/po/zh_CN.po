@@ -102,11 +102,27 @@ msgstr "启用／停用快捷键"
 msgid "System Prompt"
 msgstr "系统提示词"
 
-msgid "Keep this short and unambiguous. The model must answer with Han characters only, otherwise its output is discarded."
-msgstr "请保持简短且明确。模型必须仅输出汉字，否则输出会被丢弃。"
+msgid "Keep this short and unambiguous. Output only candidate text on a single line, without explanations or echoed keys. Chinese, English, digits and emoji are supported."
+msgstr "请保持简短且明确。仅在一行中输出候选文本，不要解释或回显输入按键。支持中文、英文、数字和 emoji。"
 
 msgid "Prompt Template"
 msgstr "提示词模板"
 
 msgid "{context} is replaced with the recently committed text, {pinyin} with the keys being typed."
 msgstr "{context} 会替换为最近输入并确认的文本，{pinyin} 会替换为正在输入的拼音。"
+
+msgid "Record request history"
+msgstr "记录请求历史"
+
+msgid "Keep the last 100 requests in memory, without context or credentials. Viewing history creates a private temporary snapshot. Disable to clear history."
+msgstr "在内存中保留最近 100 条请求，不记录上下文或凭据。查看历史时创建私有临时快照；停用会清空历史。"
+
+#, c++-format
+msgid "LLM request history {0}"
+msgstr "LLM 请求历史 {0}"
+
+msgid "View inputs, model replies, latency, adoption and native overlap. Opens a private local snapshot in your browser."
+msgstr "查看拼音输入、模型返回、耗时、采纳情况和原生候选重叠情况，在浏览器中打开私有本地快照。"
+
+msgid "Clear LLM request history"
+msgstr "清空 LLM 请求历史"

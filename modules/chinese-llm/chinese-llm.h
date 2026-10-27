@@ -7,6 +7,7 @@
 #define _CHINESE_LLM_CHINESE_LLM_H_
 
 #include "llmbackend.h"
+#include "llmhistory.h"
 #include "llmworker.h"
 #include <chrono>
 #include <cstdint>
@@ -30,6 +31,7 @@
 #include <fcitx/instance.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -42,6 +44,17 @@ FCITX_CONFIGURATION(
         "fcitx://config/addon/chinese-llm/pinyin"};
     fcitx::Option<bool> enabled{
         this, "Enabled", D_("chinese-llm", "Enable LLM candidates"), true};
+    fcitx::OptionWithAnnotation<bool, fcitx::ToolTipAnnotation> recordHistory{
+        this,
+        "RecordHistory",
+        D_("chinese-llm", "Record request history"),
+        true,
+        {},
+        {},
+        {D_("chinese-llm",
+            "Keep the last 100 requests in memory, without context or "
+            "credentials. Viewing history creates a private temporary "
+            "snapshot. Disable to clear history.")}};
     fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation> endpoint{
         this,
         "Endpoint",
@@ -114,15 +127,17 @@ FCITX_CONFIGURATION(
             this,
             "SystemPrompt",
             D_("chinese-llm", "System Prompt"),
-            "You are a Chinese pinyin input method. Convert the pinyin keys "
-            "into the most likely Chinese sentence, using the context to "
-            "disambiguate. Output only the Chinese characters on a single "
-            "line. No pinyin, no explanation, no quotes.",
+            "You are a Chinese input method. Convert the typed keys into the "
+            "most likely text, using the context to disambiguate. Preserve "
+            "English words, numbers and emoji when appropriate. Output only "
+            "candidate text on a single line. No echoed keys, no explanation, "
+            "no quotes.",
             {},
             {},
             {D_("chinese-llm",
-                "Keep this short and unambiguous. The model must answer with "
-                "Han characters only, otherwise its output is discarded.")}};
+                "Keep this short and unambiguous. Output only candidate text "
+                "on a single line, without explanations or echoed keys. "
+                "Chinese, English, digits and emoji are supported.")}};
     fcitx::OptionWithAnnotation<std::string, fcitx::ToolTipAnnotation>
         promptTemplate{this,
                        "PromptTemplate",
@@ -142,6 +157,9 @@ struct LlmState : public fcitx::InputContextProperty {
     std::string context;
     std::vector<std::string> candidates;
     uint64_t requestSeq = 0;
+    uint64_t historyId = 0;
+    // Native commits may be delivered after the engine's composition reset.
+    uint64_t commitHistoryId = 0;
     /// Pending debounce timer, reset on every keystroke.
     std::unique_ptr<fcitx::EventSourceTime> debounce;
     /// Guards against re-entering our own UI update. Inserting a candidate and
@@ -211,11 +229,18 @@ public:
         return {worker_->requestsStarted(), comparedRequests_,
                 overlappingRequests_};
     }
+    const RequestHistory &requestHistory() const { return history_; }
+    std::string historySnapshotPath() const { return historySnapshot_.path(); }
+    // launchBrowser=false lets isolated tests inspect the same snapshot safely.
+    void openHistory(bool launchBrowser = true);
+    void clearHistory();
 
 private:
     void handleUpdateUI(fcitx::Event &event);
     void handleKeyEvent(fcitx::Event &event);
-    void invalidateState(fcitx::InputContext *ic, LlmState *state);
+    void invalidateState(fcitx::InputContext *ic, LlmState *state,
+                         bool preserveCommit = false,
+                         std::string_view reason = "composition_invalidated");
     void invalidateAll();
     void removeCandidates(fcitx::InputContext *ic, LlmState *state);
     std::string currentPinyin(fcitx::InputContext *ic) const;
@@ -241,6 +266,9 @@ private:
     void toggle();
     void refreshStatus();
     void refreshStatistics();
+    void refreshHistory();
+    static bool overlapsNative(fcitx::InputContext *ic,
+                               const std::vector<std::string> &candidates);
     void compareNativeCandidates(fcitx::InputContext *ic,
                                  const std::vector<std::string> &candidates);
 
@@ -270,6 +298,12 @@ private:
     fcitx::SimpleAction overlapAction_;
     fcitx::SimpleAction rateAction_;
     fcitx::ScopedConnection toggleConnection_;
+    fcitx::SimpleAction historyAction_;
+    fcitx::SimpleAction clearHistoryAction_;
+    fcitx::ScopedConnection historyConnection_;
+    fcitx::ScopedConnection clearHistoryConnection_;
+    RequestHistory history_;
+    HistorySnapshot historySnapshot_;
     uint64_t comparedRequests_ = 0;
     uint64_t overlappingRequests_ = 0;
     std::vector<std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>>

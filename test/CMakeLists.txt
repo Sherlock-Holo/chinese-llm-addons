@@ -28,6 +28,11 @@ target_include_directories(testllmbackend PRIVATE ${PROJECT_SOURCE_DIR}/modules/
 target_link_libraries(testllmbackend Fcitx5::Core nlohmann_json::nlohmann_json)
 add_test(NAME testllmbackend COMMAND testllmbackend)
 
+add_executable(testllmhistory testllmhistory.cpp ../modules/chinese-llm/llmhistory.cpp)
+target_include_directories(testllmhistory PRIVATE ${PROJECT_SOURCE_DIR}/modules/chinese-llm)
+target_link_libraries(testllmhistory Fcitx5::Core PkgConfig::Curl)
+add_test(NAME testllmhistory COMMAND testllmhistory)
+
 add_executable(testllmconfig testllmconfig.cpp)
 target_include_directories(testllmconfig PRIVATE ${PROJECT_SOURCE_DIR}/modules/chinese-llm)
 target_link_libraries(testllmconfig Fcitx5::Core Fcitx5::Config PkgConfig::Curl nlohmann_json::nlohmann_json)

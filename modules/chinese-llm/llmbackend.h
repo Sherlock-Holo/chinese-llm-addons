@@ -60,15 +60,38 @@ std::string parseResponse(std::string_view body);
 /// finish_reason must be "stop".
 bool parseResponse(std::string_view body, std::string &content);
 
+struct RejectedCandidate {
+    std::string text;
+    std::string reason;
+};
+
+struct SanitizedCandidates {
+    std::vector<std::string> candidates;
+    std::vector<RejectedCandidate> rejected;
+};
+
+/// Sanitize with bounded per-line diagnostics. Rejection reasons are fixed codes:
+/// invalid_text, empty_or_punctuation, han_length_mismatch, key_echo and
+/// response_too_large. At most 32 rejected lines are retained, each at most 1024
+/// bytes of UTF-8-safe text (invalid bytes and controls use readable escapes).
+/// Empty/ordinary-ASCII-space-only lines are skipped, not reported as rejects.
+/// Candidate limits do not prevent recording rejected lines later in the reply.
+SanitizedCandidates sanitizeDetailed(std::string_view content,
+                                     std::string_view pinyin,
+                                     size_t maxCandidates);
+
 /// Turn raw model output into candidates that are safe to commit.
 ///
 /// This is the only place that decides whether model output may reach the
-/// candidate list, and it is deliberately strict: anything it cannot verify is
-/// dropped rather than shown. Each rule below exists because of an observed
-/// failure mode.
+/// candidate list. Accepts Han/Latin text, digits and visible emoji sequences,
+/// preserving mixed-text punctuation. Invalid UTF-8/scalars, controls,
+/// unrelated format characters, punctuation-only lines and normalized key
+/// echoes are dropped. Pure Han candidates still require a matching known
+/// syllable count; mixed/English/digit/emoji results cannot use that
+/// one-Han-per-syllable rule.
 ///
-/// @param content raw model output
-/// @param pinyin the pinyin the request was made for, used for length checks
+/// @param content raw model output (bounded by MAX_RESPONSE_BYTES)
+/// @param pinyin request keys, used for pure-Han length and exact echo checks
 /// @param maxCandidates upper bound on returned candidates, 0 means no limit
 std::vector<std::string> sanitize(std::string_view content,
                                   std::string_view pinyin,

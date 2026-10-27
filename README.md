@@ -229,6 +229,58 @@ method switches preserve them; restarting Fcitx resets them to zero. Statistics
 persist neither input content nor counters to disk. This does not change the
 separate native learning/history or in-memory LLM candidate-cache behavior.
 
+### Clickable request history monitor
+
+The LLM拼音 status menu has **LLM request history N** and **Clear LLM request
+history**. Clicking the first opens a read-only local HTML snapshot in the default
+browser (`xdg-open`), not a new HTTP service. Refresh the page or click the menu
+again for updated records. Expand a row to inspect raw model text, accepted
+candidates and rejected lines with their reason codes. Each row also shows input
+keys, time/model, HTTP status, network-plus-parsing latency in milliseconds,
+request outcome, exact native overlap and adoption. `llm` adoption means selecting
+and committing a model candidate; `native` means committing an identical native
+candidate. This tracks Fcitx commits, not acknowledgement by the destination app.
+
+`RecordHistory=True` records the last 100 submitted requests in memory, plus cache
+hits (clearly marked, with no network latency). Queued and cancelled attempts are
+not successful model replies. `usable` means the current reply passed the main
+thread's composition/privacy guards; `stale`, `cancelled`, `error`, `empty` and
+`filtered` distinguish the reasons a result did not become a candidate. Filtering
+reasons include invalid text, Han length mismatch, key echo and incomplete replies.
+The aggregate **requests N / valid V** alone cannot distinguish these outcomes.
+Cancellation retains its invalidating event (for example `focus_lost`,
+`input_keys_or_context_changed`, `composition_reset` or
+`surrounding_context_changed`) rather than only a generic `cancelled` message.
+Repeated surrounding-text notifications with unchanged effective model context
+preserve queued/in-flight requests and displayed candidates. A meaningful context
+change cancels obsolete work and reschedules the still-current composition even
+if the frontend emits no later input-panel update. Reset, focus loss, sensitive
+fields and input-method changes remain hard invalidation boundaries.
+
+No preceding context, API key, endpoint or request body is added to history. The
+feature never sends history elsewhere and does not change native learning. Each
+field is bounded: model text 8 KiB, displayed candidate/rejection/adoption text
+1 KiB and at most 32 candidates/rejections per row; visible truncation markers
+indicate omitted data. Original candidate identities for exact adoption matching
+are separately bounded to 64 KiB per row. Old entries are evicted automatically;
+cleared or evicted entries cannot reappear from late callbacks.
+
+By default no history file exists. Explicit viewing creates a snapshot in a private
+0700 temporary directory with a 0600 file (XDG runtime directory, or a private
+system-temp fallback). After opening, new records/commits update that snapshot.
+Clearing history, disabling `RecordHistory`, entering a password/sensitive field
+or unloading the addon clears history and removes the snapshot. An already-open
+browser tab may retain its old view/cache; clear that separately if needed. A crash
+can leave temporary files until runtime/temp cleanup. This is an opt-out,
+normal-input in-memory monitor, not a permanent typing log. Toggle recording in
+the addon settings; changing only that switch does not reset your composition.
+
+If a model works via a manual request but not in the input method, inspect that
+input's history row rather than assuming English was filtered. A manual request
+with no context need not reproduce the actual Fcitx process's transport or
+composition state. For a privacy-preserving comparison you can temporarily set
+`ContextLength=0`; no private context needs to be shared for initial diagnosis.
+
 ## OpenAI-compatible endpoint
 
 `Endpoint` is the **complete Chat Completions URL**, not just a base URL or `/v1`.
@@ -266,7 +318,11 @@ connection-test button, automatic model listing or model-service startup yet.
 - `ContextLength=64` (0 disables surrounding-text use), `CacheSize=256`.
 - `MaxConsecutiveErrors=5`, `CooldownSeconds=120`.
 - `ToggleKey=Control+Alt+Shift+L`: only intercepted in LLM拼音.
-- `SystemPrompt`: request Chinese characters only, with no explanation.
+- `SystemPrompt`: request candidate text only, preserving appropriate English,
+  numbers and emoji, with no explanation or echoed input keys. Existing saved
+  prompts are not overwritten; update a previously Chinese-only prompt in the
+  GUI when using a general chat model. Beam's dedicated key-format template can
+  ignore the system prompt.
 - `PromptTemplate={context}\n{pinyin}`: placeholders for preceding text/raw keys.
 
 Temperature 0 and `max_tokens=64` are currently fixed in code. The independent
@@ -280,11 +336,30 @@ invalidate old results. Curl aborts stale transfers, and main-thread delivery an
 selection recheck sequence, generation, composition, privacy and surrounding text.
 Nothing is auto-committed: the user explicitly selects a candidate.
 
-Output validation rejects invalid UTF-8, English/digits/punctuation-only text,
-truncated completions and incompatible Han/syllable counts. It cannot guarantee
-the model chose the correct pronunciation. Partial selections and immutable
-stroke/action-filtered candidate lists suppress the model path. Raw server preedit
-is preferred over Chinese client commit-preview text.
+Output validation accepts Chinese/Latin text, numbers and visible emoji, including
+mixed candidates such as `帮我push一下`, English such as `Hello world!`, and emoji
+such as `👍🏽` or `👩‍💻`. Spaces and punctuation inside mixed/English results are
+preserved, as are emoji presentation selectors, skin tones, ZWJ sequences, keycaps
+and regional/subdivision flags. Pure Han results retain the legacy removal of
+model-added edge quotes/punctuation and must still match a known syllable count.
+That one-Han-per-syllable check does **not** apply to Latin/digit/emoji results.
+Model candidates commit their text directly and do not enter native pinyin learning.
+
+Validation still rejects invalid UTF-8/Unicode scalars, control characters (including
+tabs, NUL and bare CR), bidi controls, unrelated invisible formatting, malformed or
+standalone emoji joiners/selectors/tags, punctuation-only content, oversized replies
+and explicitly incomplete completions. LF separates candidate lines; CRLF is also
+accepted, but those separators are never committed. Exact input-key echoes are
+rejected after ignoring ASCII case, spaces, apostrophes and model-added edge
+wrappers/punctuation. A pure English output identical to its input keys is ambiguous
+and is conservatively treated as an echo, not an exception to validation. The
+validator cannot establish semantic correctness or guarantee that a nonidentical
+English result is not a model explanation; keep prompts limited to candidate text.
+
+Partial selections and immutable stroke/action-filtered candidate lists suppress
+the model path. Raw server preedit is preferred over Chinese client commit-preview
+text. Request eligibility still requires ASCII letter keys; accepting English,
+digits and emoji **output** does not change the native engine's key handling.
 
 A timeout, dead endpoint, non-200 response or malformed JSON simply yields no
 model suggestions; native candidates remain. Repeated errors enter a cooldown

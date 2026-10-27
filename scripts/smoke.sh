@@ -122,10 +122,30 @@ run_checked config 'All config tests passed' "$RUN_DIR/config.log" "$BUILD_DIR/b
 run_checked worker 'All worker tests passed' "$RUN_DIR/worker.log" \
     "$BUILD_DIR/bin/testllmworker" "$BASE/v1/chat/completions"
 
-for scenario in live debounce disabled dead preview reset partial toggle toggle-inflight sensitive sensitive-inflight context cache cooldown config filtered metadata original-pinyin original-shuangpin switch-inflight switch-results own-config virtual-keyboard preedit-click modifier-selection modifier-selection-global llm-alone private-settings customphrase-isolation learning-isolation learning-reload private-actions native-description cloud-badge badge-off llm-status stats-overlap stats-empty stats-error stats-invalid stats-all-filtered stats-limit stats-rate stats-focus; do
+for scenario in mixed-contiguous-surrounding mixed-contiguous-surrounding-inflight mixed-contiguous-surrounding-visible mixed-context-changed mixed-contiguous-commit mixed-contiguous-commit-blocked live mixed mixed-badge-off english digits emoji emoji-tag debounce disabled dead preview reset partial toggle toggle-inflight sensitive sensitive-inflight context cache cooldown config filtered metadata original-pinyin original-shuangpin switch-inflight switch-results own-config virtual-keyboard preedit-click modifier-selection modifier-selection-global llm-alone private-settings customphrase-isolation learning-isolation learning-reload private-actions native-description cloud-badge badge-off llm-status stats-overlap stats-empty stats-error stats-invalid stats-all-filtered stats-limit stats-rate stats-focus history-menu history-disabled history-disable-live history-privacy history-stale history-native-blocked; do
     scenario_dir="$RUN_DIR/$scenario"
     mkdir -p "$scenario_dir"/{config/conf,data,cache,runtime}
     chmod 700 "$scenario_dir/runtime"
+    # Never let a history regression launch the developer's real browser. The
+    # isolated opener records arguments and the snapshot while it still exists.
+    mkdir -p "$scenario_dir/bin"
+    printf '%s\n' '#!/usr/bin/env python3' >"$scenario_dir/bin/xdg-open"
+    python3 - "$scenario_dir/bin/xdg-open" <<'PY'
+import pathlib
+import sys
+with pathlib.Path(sys.argv[1]).open("a") as stream:
+    stream.write('''import json, os, pathlib, stat, sys, urllib.parse
+argument = sys.argv[1]
+uri = urllib.parse.urlsplit(argument)
+path = pathlib.Path(urllib.parse.unquote(uri.path) if uri.scheme == "file" else argument)
+record = {"args": sys.argv[1:], "path": str(path), "html": path.read_text(),
+          "file_mode": stat.S_IMODE(path.stat().st_mode),
+          "directory_mode": stat.S_IMODE(path.parent.stat().st_mode)}
+with open(os.environ["FCITX_TEST_HISTORY_OPENER_LOG"], "a") as output:
+    output.write(json.dumps(record, ensure_ascii=False) + "\\n")
+''')
+PY
+    chmod 700 "$scenario_dir/bin/xdg-open"
     # An explicit profile avoids host preferences and first-run IM selection.
     default_im=llm-pinyin
     case "$scenario" in
@@ -183,17 +203,23 @@ PY
     curl --noproxy '*' --fail --silent --max-time 2 -X POST "$BASE/reset" > /dev/null
     endpoint="$BASE/v1/chat/completions"
     case "$scenario" in
+        mixed-contiguous-surrounding|mixed-contiguous-surrounding-inflight|mixed-contiguous-surrounding-visible|mixed-context-changed|mixed-contiguous-commit|mixed-contiguous-commit-blocked) endpoint="$BASE/mixed-contiguous-commit/v1/chat/completions" ;;
+        mixed|mixed-badge-off) endpoint="$BASE/mixed/v1/chat/completions" ;;
+        english|digits|emoji|emoji-tag) endpoint="$BASE/$scenario/v1/chat/completions" ;;
         dead) endpoint="http://127.0.0.1:$DEAD_PORT/v1/chat/completions" ;;
         cooldown|stats-error) endpoint="$BASE/error/v1/chat/completions" ;;
         stats-empty) endpoint="$BASE/empty/v1/chat/completions" ;;
         stats-invalid) endpoint="$BASE/invalid/v1/chat/completions" ;;
         stats-all-filtered) endpoint="$BASE/all-filtered/v1/chat/completions" ;;
         stats-limit) endpoint="$BASE/late-overlap/v1/chat/completions" ;;
+        history-menu) endpoint="$BASE/history-rich/v1/chat/completions" ;;
     esac
     # The mock reserves DEAD_PORT without listening, so connection refusal is
     # deterministic and never counted as test success solely due to a timeout.
     run_checked "addon/$scenario" "all addon tests passed: $scenario" "$scenario_dir/test.log" \
-        env FCITX_ADDON_DIRS="$ADDON_DIRS" FCITX_DATA_DIRS="$DATA_DIRS" \
+        env PATH="$scenario_dir/bin:$PATH" \
+            FCITX_TEST_HISTORY_OPENER_LOG="$scenario_dir/opener.jsonl" \
+            FCITX_ADDON_DIRS="$ADDON_DIRS" FCITX_DATA_DIRS="$DATA_DIRS" \
             FCITX_CONFIG_HOME="$scenario_dir/config" FCITX_DATA_HOME="$scenario_dir/data" \
             FCITX_CONFIG_DIRS="$scenario_dir/config" \
             XDG_CONFIG_HOME="$scenario_dir/config" XDG_DATA_HOME="$scenario_dir/data" \
@@ -240,7 +266,15 @@ import sys
 scenario = sys.argv[1]
 stats = json.load(open(sys.argv[2]))
 count = stats["count"]
-expected = {"live": 1, "debounce": 1, "disabled": 0, "dead": 0,
+expected = {"mixed-contiguous-surrounding": 1,
+            "mixed-contiguous-surrounding-inflight": 1,
+            "mixed-contiguous-surrounding-visible": 1,
+            "mixed-context-changed": 1,
+            "mixed-contiguous-commit": 1,
+            "mixed-contiguous-commit-blocked": 1,
+            "live": 1, "mixed": 1, "mixed-badge-off": 1, "english": 1,
+            "digits": 1, "emoji": 1, "emoji-tag": 1,
+            "debounce": 1, "disabled": 0, "dead": 0,
             "preview": 1, "sensitive": 0, "toggle": 0, "partial": 1,
             "toggle-inflight": 1, "sensitive-inflight": 1,
             "reset": 2, "context": 2, "cache": 2, "cooldown": 2, "config": 2, "filtered": 1,
@@ -253,11 +287,49 @@ expected = {"live": 1, "debounce": 1, "disabled": 0, "dead": 0,
              "cloud-badge": 1, "badge-off": 1, "llm-status": 0,
              "stats-overlap": 1, "stats-empty": 1, "stats-error": 1,
              "stats-invalid": 1, "stats-all-filtered": 1, "stats-limit": 1,
-             "stats-rate": 3, "stats-focus": 2}
+             "stats-rate": 3, "stats-focus": 2,
+             "history-menu": 1, "history-disabled": 1,
+             "history-disable-live": 1, "history-privacy": 2,
+             "history-stale": 1, "history-native-blocked": 1}
 assert scenario in expected, f"missing request-count assertion for {scenario}"
 assert count == expected[scenario], f"{scenario}: expected {expected[scenario]} POSTs, got {count}"
 if scenario in {"own-config", "metadata", "original-pinyin", "original-shuangpin"}:
     assert not stats["requests"], f"{scenario}: original/config-only path touched network"
+if scenario in {"mixed", "mixed-badge-off", "english", "digits", "emoji", "emoji-tag"}:
+    record = stats["requests"][0]
+    endpoint_kind = "mixed" if scenario == "mixed-badge-off" else scenario
+    assert record["path"] == f"/{endpoint_kind}/v1/chat/completions", f"{scenario}: wrong payload fixture"
+    assert "'" in record["pinyin"], f"{scenario}: must exercise separated pinyin length policy"
+    assert record["authorization"] == "", f"{scenario}: leaked host API key to mock"
+if scenario.startswith("mixed-contiguous-") or scenario == "mixed-context-changed":
+    record = stats["requests"][0]
+    normalized = record["pinyin"].replace("'", "").replace(" ", "").lower()
+    assert normalized == "bangwocommityixia", f"{scenario}: no final complete-input request: {record['pinyin']}"
+    assert record["path"] == "/mixed-contiguous-commit/v1/chat/completions", f"{scenario}: wrong mixed reply fixture"
+    assert record["authorization"] == "", f"{scenario}: leaked host API key"
+    if scenario == "mixed-context-changed":
+        assert "safe-context-after" in record["user"] and "safe-context-before" not in record["user"], "context change did not automatically submit only the new context"
+    if scenario == "mixed-contiguous-surrounding-visible":
+        assert "safe-context-before" in record["user"], "visible candidate probe must use an effective nonempty context"
+import pathlib
+root = pathlib.Path(sys.argv[2]).parent
+opener_log = root / "opener.jsonl"
+if scenario in {"history-menu", "history-disable-live", "history-privacy"}:
+    launches = [json.loads(line) for line in opener_log.read_text().splitlines()]
+    assert len(launches) == 1, "history menu must launch only the explicit view once"
+    launch = launches[0]
+    assert len(launch["args"]) == 1 and launch["file_mode"] == 0o600 and launch["directory_mode"] == 0o700, "opener snapshot permissions/arguments wrong"
+    if scenario == "history-menu":
+        assert "history-html-marker" in launch["html"] and "&lt;script&gt;" in launch["html"] and "<script>" not in launch["html"], "snapshot executed/lost model HTML"
+    if scenario == "history-privacy":
+        assert "private-context-never-record" not in launch["html"] and "history-private-key-sentinel" not in launch["html"], "opener snapshot leaked context/credential sentinels"
+    snapshot = pathlib.Path(launch["path"])
+    assert not snapshot.exists() and not snapshot.parent.exists(), "clear/shutdown retained temporary snapshot"
+else:
+    assert not opener_log.exists(), f"{scenario}: history opened browser without explicit menu click"
+assert not list((root / "runtime").rglob("*.html")), f"{scenario}: shutdown left private history files"
+if scenario == "history-privacy":
+    assert all("private-context-never-record" in record["user"] and record["authorization"] == "Bearer history-private-key-sentinel" for record in stats["requests"]), "privacy test failed to send its harmless context/key sentinels"
 print(f"  server requests: {count}")
 PY
     then

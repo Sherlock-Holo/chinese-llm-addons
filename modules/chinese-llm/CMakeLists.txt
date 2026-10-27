@@ -2,6 +2,7 @@ set(CHINESE_LLM_SOURCES
     chinese-llm.cpp
     llmbackend.cpp
     llmworker.cpp
+    llmhistory.cpp
 )
 
 if (ENABLE_CHINESE_LLM)

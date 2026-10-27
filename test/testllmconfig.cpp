@@ -43,12 +43,28 @@ int main(int argc, char *argv[]) {
         fcitx::registerDomain("chinese-llm", std::filesystem::path{argv[2]});
     }
     ChineseLlmConfig config;
+    if (!config.recordHistory.value()) {
+        std::cerr << "request history must be enabled by default\n";
+        return 1;
+    }
+    const auto &defaultPrompt = config.systemPrompt.value();
+    if (defaultPrompt.find("Preserve English words, numbers and emoji") ==
+            std::string::npos ||
+        defaultPrompt.find("Output only candidate text on a single line") ==
+            std::string::npos ||
+        defaultPrompt.find("No echoed keys") == std::string::npos ||
+        defaultPrompt.find("Han characters only") != std::string::npos) {
+        std::cerr << "default prompt must support mixed-language candidates "
+                     "without permitting key echo/explanations\n";
+        return 1;
+    }
     fcitx::RawConfig raw;
     std::istringstream input(
         "Endpoint=http://127.0.0.1:8080/v1/chat/completions\n"
         "Model=beam-0.6b\n"
         "ApiKey=test-token\n"
         "Enabled=False\n"
+        "RecordHistory=False\n"
         "ContextLength=2\n");
     fcitx::readFromIni(raw, input);
     config.load(raw, true);
@@ -56,7 +72,7 @@ int main(int argc, char *argv[]) {
             "http://127.0.0.1:8080/v1/chat/completions" ||
         config.model.value() != "beam-0.6b" ||
         config.apiKey.value() != "test-token" || config.enabled.value() ||
-        config.contextLength.value() != 2) {
+        config.recordHistory.value() || config.contextLength.value() != 2) {
         std::cerr << "flat INI configuration was not loaded\n";
         return 1;
     }
@@ -65,7 +81,8 @@ int main(int argc, char *argv[]) {
     std::ostringstream output;
     fcitx::writeAsIni(saved, output);
     if (output.str().find("[ChineseLlm]") != std::string::npos ||
-        output.str().find("Model=beam-0.6b") == std::string::npos) {
+        output.str().find("Model=beam-0.6b") == std::string::npos ||
+        output.str().find("RecordHistory=False") == std::string::npos) {
         std::cerr << "configuration did not round-trip as flat INI\n";
         return 1;
     }
@@ -89,6 +106,7 @@ int main(int argc, char *argv[]) {
         {"MaxConsecutiveErrors", "Integer"},
         {"CooldownSeconds", "Integer"},
         {"ShowBadge", "Boolean"},
+        {"RecordHistory", "Boolean"},
         {"ToggleKey", "List|Key"},
         {"SystemPrompt", "String"},
         {"PromptTemplate", "String"}};
@@ -112,6 +130,7 @@ int main(int argc, char *argv[]) {
         {"ShowBadge",
          {"Show cloud marker on LLM candidates",
           "在 LLM 候选词旁显示云朵标记"}},
+        {"RecordHistory", {"Record request history", "记录请求历史"}},
         {"ToggleKey", {"Toggle Key", "启用／停用快捷键"}},
         {"SystemPrompt", {"System Prompt", "系统提示词"}},
         {"PromptTemplate", {"Prompt Template", "提示词模板"}}};
@@ -124,12 +143,16 @@ int main(int argc, char *argv[]) {
         {"ApiKey", "以 Bearer "
                    "令牌发送。不需要身份验证的本地服务可以留空；留空时会尝试使"
                    "用环境变量 FCITX_CHINESE_LLM_API_KEY。"},
+        {"RecordHistory",
+         "在内存中保留最近 100 条请求，不记录上下文或凭据。查看历史时创建私有"
+         "临时快照；停用会清空历史。"},
         {"SystemPrompt",
-         "请保持简短且明确。模型必须仅输出汉字，否则输出会被丢弃。"},
+         "请保持简短且明确。仅在一行中输出候选文本，不要解释或回显输入按键。"
+         "支持中文、英文、数字和 emoji。"},
         {"PromptTemplate", "{context} 会替换为最近输入并确认的文本，{pinyin} "
                            "会替换为正在输入的拼音。"}};
     if (!root || root->subItemsSize() != expected.size()) {
-        std::cerr << "root GUI description does not expose 18 independent "
+        std::cerr << "root GUI description does not expose 19 independent "
                      "settings/link fields\n";
         return 1;
     }
@@ -157,7 +180,17 @@ int main(int argc, char *argv[]) {
         for (const auto &[field, translation] : tooltips) {
             const auto *tooltip =
                 description.valueByPath(rootType + '/' + field + "/Tooltip");
-            if (!tooltip || (chinese && *tooltip != translation)) {
+            if (!tooltip || (chinese && *tooltip != translation) ||
+                (!chinese && field == "SystemPrompt" &&
+                 *tooltip != "Keep this short and unambiguous. Output only "
+                             "candidate text on a single line, without "
+                             "explanations or echoed keys. Chinese, English, "
+                             "digits and emoji are supported.") ||
+                (!chinese && field == "RecordHistory" &&
+                 *tooltip != "Keep the last 100 requests in memory, without "
+                             "context or credentials. Viewing history creates "
+                             "a private temporary snapshot. Disable to clear "
+                             "history.")) {
                 std::cerr << "wrong localized GUI tooltip: " << field << '\n';
                 return 1;
             }
@@ -172,6 +205,7 @@ int main(int argc, char *argv[]) {
             {"LLM requests {0} (valid {1})", "LLM 请求 {0}（有效 {1}）"},
             {"LLM overlapping requests {0}", "LLM 重叠请求 {0}"},
             {"LLM overlap rate {0}", "LLM 重叠率 {0}"},
+            {"LLM request history {0}", "LLM 请求历史 {0}"},
             {"Requests started in this Fcitx session, including failures and "
              "cancellations. Valid requests returned usable candidates for "
              "the current input. Cache hits are not requests.",
@@ -219,7 +253,11 @@ int main(int argc, char *argv[]) {
             const auto rate = std::format("{:.1f}%", 100.0 / 3.0);
             const auto zeroRate = std::format("{:.1f}%", 0.0);
             const auto fullRate = std::format("{:.1f}%", 100.0);
-            if (!checkFormat("LLM requests {0} (valid {1})",
+            if (!checkFormat("LLM request history {0}",
+                             chinese ? "LLM 请求历史 17"
+                                     : "LLM request history 17",
+                             sent) ||
+                !checkFormat("LLM requests {0} (valid {1})",
                              chinese ? "LLM 请求 17（有效 3）"
                                      : "LLM requests 17 (valid 3)",
                              sent, compared) ||

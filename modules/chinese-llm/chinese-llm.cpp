@@ -57,8 +57,10 @@ constexpr char kBadge[] = "\u2601\uFE0E";
 class LlmCandidateWord : public fcitx::CandidateWord {
 public:
     LlmCandidateWord(std::string text, bool badge,
-                     std::function<bool(fcitx::InputContext *)> valid)
-        : text_(std::move(text)), valid_(std::move(valid)) {
+                     std::function<bool(fcitx::InputContext *)> valid,
+                     std::function<void()> adopted)
+        : text_(std::move(text)), valid_(std::move(valid)),
+          adopted_(std::move(adopted)) {
         setText(fcitx::Text(text_));
         if (badge) {
             fcitx::Text comment(kBadge);
@@ -72,6 +74,9 @@ public:
             return;
         }
         inputContext->commitString(text_);
+        if (adopted_) {
+            adopted_();
+        }
         inputContext->inputPanel().reset();
         inputContext->reset();
     }
@@ -79,6 +84,7 @@ public:
 private:
     std::string text_;
     std::function<bool(fcitx::InputContext *)> valid_;
+    std::function<void()> adopted_;
 };
 
 } // namespace
@@ -129,6 +135,33 @@ ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
         "until "
         "a valid request completes. Statistics reset when Fcitx restarts; no "
         "input text is saved."));
+    historyAction_.registerAction("chinese-llm-history",
+                                  &instance_->userInterfaceManager());
+    clearHistoryAction_.registerAction("chinese-llm-history-clear",
+                                       &instance_->userInterfaceManager());
+    historyAction_.setIcon("document-open-recent");
+    historyAction_.setLongText(
+        D_("chinese-llm",
+           "View inputs, model replies, latency, adoption and native "
+           "overlap. Opens a private local snapshot in your browser."));
+    clearHistoryAction_.setIcon("edit-clear-history");
+    clearHistoryAction_.setShortText(
+        D_("chinese-llm", "Clear LLM request history"));
+    historyConnection_ = historyAction_.connect<SimpleAction::Activated>(
+        [this](InputContext *ic) {
+            if (ic && isLlmInputMethod(ic) &&
+                ic->statusArea().isChild(&historyAction_)) {
+                openHistory();
+            }
+        });
+    clearHistoryConnection_ =
+        clearHistoryAction_.connect<SimpleAction::Activated>(
+            [this](InputContext *ic) {
+                if (ic && isLlmInputMethod(ic) &&
+                    ic->statusArea().isChild(&clearHistoryAction_)) {
+                    clearHistory();
+                }
+            });
     refreshStatistics();
     reloadConfig();
 
@@ -151,15 +184,90 @@ ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
     for (const auto type :
          {EventType::InputContextReset, EventType::InputContextFocusOut,
           EventType::InputContextSwitchInputMethod,
-          EventType::InputContextCapabilityAboutToChange,
-          EventType::InputContextSurroundingTextUpdated}) {
+          EventType::InputContextCapabilityAboutToChange}) {
         eventWatchers_.emplace_back(instance_->watchEvent(
             type, EventWatcherPhase::PreInputMethod, [this](Event &event) {
                 auto *ic =
                     static_cast<InputContextEvent &>(event).inputContext();
-                invalidateState(ic, ic->propertyFor(&factory_));
+                if (event.type() ==
+                        EventType::InputContextCapabilityAboutToChange &&
+                    static_cast<CapabilityAboutToChangeEvent &>(event)
+                        .newFlags()
+                        .testAny(CapabilityFlag::PasswordOrSensitive)) {
+                    clearHistory();
+                }
+                const auto reason =
+                    event.type() == EventType::InputContextFocusOut
+                        ? "focus_lost"
+                    : event.type() == EventType::InputContextReset
+                        ? "composition_reset"
+                    : event.type() == EventType::InputContextSwitchInputMethod
+                        ? "input_method_changed"
+                        : "capabilities_changed";
+                invalidateState(ic, ic->propertyFor(&factory_),
+                                event.type() == EventType::InputContextReset,
+                                reason);
             }));
     }
+    eventWatchers_.emplace_back(instance_->watchEvent(
+        EventType::InputContextSurroundingTextUpdated,
+        EventWatcherPhase::PreInputMethod, [this](Event &event) {
+            auto *ic = static_cast<InputContextEvent &>(event).inputContext();
+            auto *state = ic->propertyFor(&factory_);
+            // Surrounding-text notifications are not composition boundaries.
+            // Frontends routinely repeat the same value after preedit updates.
+            // Invalidate only when the effective context sent to the model
+            // differs; otherwise preserve pending timers and visible results.
+            if (!isLlmInputMethod(ic) ||
+                ic->capabilityFlags().testAny(
+                    CapabilityFlag::PasswordOrSensitive) ||
+                state->pinyin.empty() || buildContext(ic) == state->context) {
+                return;
+            }
+            invalidateState(ic, state, false, "surrounding_context_changed");
+            // A surrounding update need not be followed by an InputPanel UI
+            // event. Retry the still-current composition on the main thread,
+            // using fresh context and all the usual eligibility/privacy guards.
+            dispatcher_.schedule([owner = watch(), ref = ic->watch()] {
+                if (auto *self = owner.get()) {
+                    if (auto *ic = ref.get(); ic && self->isEligible(ic)) {
+                        ic->updateUserInterface(
+                            UserInterfaceComponent::InputPanel);
+                    }
+                }
+            });
+        }));
+    eventWatchers_.emplace_back(instance_->watchEvent(
+        EventType::InputContextKeyEvent, EventWatcherPhase::PreInputMethod,
+        [this](Event &event) {
+            auto *state =
+                static_cast<KeyEvent &>(event).inputContext()->propertyFor(
+                    &factory_);
+            if (state->pinyin.empty()) {
+                state->commitHistoryId = 0;
+            }
+        }));
+    eventWatchers_.emplace_back(instance_->watchEvent(
+        EventType::InputContextCommitString, EventWatcherPhase::PostInputMethod,
+        [this](Event &event) {
+            auto &commit = static_cast<CommitStringEvent &>(event);
+            auto *ic = commit.inputContext();
+            if (!config_.recordHistory.value() || !isLlmInputMethod(ic) ||
+                ic->capabilityFlags().testAny(
+                    CapabilityFlag::PasswordOrSensitive)) {
+                return;
+            }
+            auto *state = ic->propertyFor(&factory_);
+            const auto id =
+                state->historyId ? state->historyId : state->commitHistoryId;
+            if (const auto *entry = history_.find(id);
+                entry && entry->adoption.empty() &&
+                (entry->status == "usable" || entry->status == "cache_hit")) {
+                history_.adopt(id, commit.text(), true);
+                refreshHistory();
+            }
+            state->commitHistoryId = 0;
+        }));
 
     worker_->start();
     FCITX_INFO() << "chinese-llm: loaded, endpoint "
@@ -168,9 +276,12 @@ ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
 
 ChineseLlm::~ChineseLlm() {
     toggleConnection_.disconnect();
+    historyConnection_.disconnect();
+    clearHistoryConnection_.disconnect();
     eventWatchers_.clear();
     invalidateAll();
     worker_->stop();
+    clearHistory();
 }
 
 void ChineseLlm::keyEvent(const InputMethodEntry &, KeyEvent &event) {
@@ -184,8 +295,9 @@ void ChineseLlm::activate(const InputMethodEntry &, InputContextEvent &event) {
     // Refresh before attaching: a transfer may have started while another IM
     // was active. Every row belongs only to our own InputMethod status group.
     refreshStatistics();
-    for (auto *action :
-         {&toggleAction_, &requestsAction_, &overlapAction_, &rateAction_}) {
+    refreshHistory();
+    for (auto *action : {&toggleAction_, &requestsAction_, &overlapAction_,
+                         &rateAction_, &historyAction_, &clearHistoryAction_}) {
         ic->statusArea().addAction(StatusGroup::InputMethod, action);
     }
     toggleAction_.update(ic);
@@ -194,8 +306,10 @@ void ChineseLlm::activate(const InputMethodEntry &, InputContextEvent &event) {
 void ChineseLlm::deactivate(const InputMethodEntry &,
                             InputContextEvent &event) {
     auto *ic = event.inputContext();
-    // Remove AI candidates before native deactivation handles commit/clear.
-    invalidateState(ic, ic->propertyFor(&factory_));
+    // Core can invoke deactivation before our boundary watcher. Retain an
+    // accurate category rather than losing it to a generic cancellation.
+    invalidateState(ic, ic->propertyFor(&factory_), false,
+                    "input_method_deactivated");
     pinyin_->deactivate(pinyinEntry_, event);
     // Retain the selected IM's action across transient focus loss (shell
     // menus). Fcitx clears the InputMethod status group before activating
@@ -204,7 +318,7 @@ void ChineseLlm::deactivate(const InputMethodEntry &,
 
 void ChineseLlm::reset(const InputMethodEntry &, InputContextEvent &event) {
     auto *ic = event.inputContext();
-    invalidateState(ic, ic->propertyFor(&factory_));
+    invalidateState(ic, ic->propertyFor(&factory_), true, "composition_reset");
     pinyin_->reset(pinyinEntry_, event);
 }
 
@@ -245,12 +359,29 @@ void ChineseLlm::reloadConfig() {
     cacheOrder_.clear();
     errorCount_ = 0;
     cooldownUntil_ = {};
+    if (!config_.recordHistory.value()) {
+        clearHistory();
+    }
+    refreshHistory();
     refreshStatus();
 }
 
 void ChineseLlm::setConfig(const fcitx::RawConfig &config) {
+    RawConfig before;
+    config_.save(before);
     config_.load(config, true);
+    RawConfig after;
+    config_.save(after);
+    before.remove("RecordHistory");
+    after.remove("RecordHistory");
     fcitx::safeSaveAsIni(config_, "conf/chinese-llm.conf");
+    if (!config_.recordHistory.value()) {
+        clearHistory();
+    }
+    refreshHistory();
+    if (before == after) {
+        return;
+    }
     invalidateAll();
     cache_.clear();
     cacheOrder_.clear();
@@ -410,7 +541,20 @@ void ChineseLlm::removeCandidates(fcitx::InputContext *ic, LlmState *state) {
     }
 }
 
-void ChineseLlm::invalidateState(fcitx::InputContext *ic, LlmState *state) {
+void ChineseLlm::invalidateState(fcitx::InputContext *ic, LlmState *state,
+                                 bool preserveCommit, std::string_view reason) {
+    if (preserveCommit && state->historyId) {
+        state->commitHistoryId = state->historyId;
+    } else if (!preserveCommit) {
+        state->commitHistoryId = 0;
+    }
+    if (auto *entry = history_.find(state->historyId);
+        entry && (entry->status == "queued" || entry->status == "inflight")) {
+        entry->status = "cancelled";
+        entry->error = std::string(reason);
+        refreshHistory();
+    }
+    state->historyId = 0;
     state->generation++;
     state->debounce.reset();
     if (state->requestSeq && state->requestSeq == worker_->currentSeq()) {
@@ -446,13 +590,22 @@ void ChineseLlm::handleUpdateUI(fcitx::Event &event) {
     if (state->inserting) {
         return;
     }
+    // Real frontends can block commit events while native selection already
+    // clears the panel. Keep its history identity until the queued commit is
+    // delivered, or until the next key starts an unrelated composition.
+    const bool emptyOwnComposition =
+        isLlmInputMethod(ic) && config_.enabled.value() &&
+        !ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive) &&
+        ic->inputPanel().preedit().empty() &&
+        ic->inputPanel().clientPreedit().empty();
     if (!isEligible(ic)) {
-        invalidateState(ic, state);
+        invalidateState(ic, state, emptyOwnComposition, "input_not_eligible");
         return;
     }
     auto pinyin = currentPinyin(ic);
     if (pinyin.empty()) {
-        invalidateState(ic, state);
+        invalidateState(ic, state, emptyOwnComposition,
+                        "input_not_plain_pinyin");
         return;
     }
     auto context = buildContext(ic);
@@ -462,7 +615,7 @@ void ChineseLlm::handleUpdateUI(fcitx::Event &event) {
         insertCandidates(ic, state, state->candidates);
         return;
     }
-    invalidateState(ic, state);
+    invalidateState(ic, state, false, "input_keys_or_context_changed");
     state->pinyin = pinyin;
     state->context = context;
 
@@ -471,6 +624,19 @@ void ChineseLlm::handleUpdateUI(fcitx::Event &event) {
         std::erase(cacheOrder_, key);
         cacheOrder_.push_back(key);
         state->candidates = iter->second;
+        if (config_.recordHistory.value()) {
+            state->historyId = history_.begin(pinyin, config_.model.value());
+            FetchResult cached;
+            cached.ok = true;
+            cached.pinyin = pinyin;
+            cached.candidates = state->candidates;
+            history_.complete(state->historyId, cached);
+            if (auto *entry = history_.find(state->historyId)) {
+                entry->status = "cache_hit";
+                entry->overlap = overlapsNative(ic, cached.candidates);
+            }
+            refreshHistory();
+        }
         insertCandidates(ic, state, state->candidates);
         return;
     }
@@ -521,11 +687,15 @@ void ChineseLlm::dispatchRequest(fcitx::InputContext *ic, LlmState *state,
     // not only the client, so unloading cannot leave a raw-this callback
     // behind.
     auto ref = ic->watch();
+    const auto historyId = config_.recordHistory.value()
+                               ? history_.begin(pinyin, config_.model.value())
+                               : 0;
+    state->historyId = historyId;
     state->requestSeq = worker_->submit(
         backendConfig(), std::move(pinyin), context,
-        [dispatcher = &dispatcher_, owner = watch(), ref, context,
-         generation](FetchResult result) {
-            dispatcher->schedule([owner, ref, context, generation,
+        [dispatcher = &dispatcher_, owner = watch(), ref, context, generation,
+         historyId](FetchResult result) {
+            dispatcher->schedule([owner, ref, context, generation, historyId,
                                   result = std::move(result)]() {
                 auto *self = owner.get();
                 auto *ic = ref.get();
@@ -537,6 +707,13 @@ void ChineseLlm::dispatchRequest(fcitx::InputContext *ic, LlmState *state,
                     state->generation != generation || !self->isEligible(ic) ||
                     self->currentPinyin(ic) != result.pinyin ||
                     self->buildContext(ic) != context) {
+                    if (auto *entry = self->history_.find(historyId);
+                        entry && result.ok && !result.cancelled) {
+                        entry->status = "stale";
+                        entry->error =
+                            "Reply no longer matches the current input";
+                        self->refreshHistory();
+                    }
                     return;
                 }
                 state->requestSeq = 0;
@@ -552,22 +729,74 @@ void ChineseLlm::dispatchRequest(fcitx::InputContext *ic, LlmState *state,
                 // Only fresh, usable network results enter the denominator.
                 // Account before insertion, so neither our own candidates nor
                 // later cache/UI replays can be mistaken for native matches.
+                if (auto *entry = self->history_.find(historyId)) {
+                    entry->status = "usable";
+                    entry->overlap = overlapsNative(ic, result.candidates);
+                    self->refreshHistory();
+                }
                 self->compareNativeCandidates(ic, result.candidates);
                 self->rememberCandidates(cacheKey(result.pinyin, context),
                                          result.candidates);
                 self->insertCandidates(ic, state, state->candidates);
             });
         },
-        [dispatcher = &dispatcher_, owner = watch()] {
-            // Start notifications must survive seq/IC invalidation: the
-            // transfer was still attempted even if typing cancels its reply.
-            // Never access Fcitx actions from the worker thread.
-            dispatcher->schedule([owner] {
+        [dispatcher = &dispatcher_, owner = watch(), historyId] {
+            // Start notifications survive invalidation, but never recreate a
+            // history row that the user cleared or privacy handling removed.
+            dispatcher->schedule([owner, historyId] {
                 if (auto *self = owner.get()) {
+                    if (auto *entry = self->history_.find(historyId)) {
+                        entry->started = true;
+                        if (entry->status == "queued") {
+                            entry->status = "inflight";
+                        }
+                        self->refreshHistory();
+                    }
                     self->refreshStatistics();
                 }
             });
+        },
+        [dispatcher = &dispatcher_, owner = watch(), ref, context, generation,
+         historyId](FetchResult result) {
+            dispatcher->schedule([owner, ref, context, generation, historyId,
+                                  result = std::move(result)] {
+                auto *self = owner.get();
+                if (!self || !self->config_.recordHistory.value() ||
+                    !self->history_.find(historyId)) {
+                    return;
+                }
+                auto *ic = ref.get();
+                if (ic && ic->capabilityFlags().testAny(
+                              CapabilityFlag::PasswordOrSensitive)) {
+                    self->clearHistory();
+                    return;
+                }
+                const auto *previous = self->history_.find(historyId);
+                const auto cancellationReason =
+                    previous && previous->status == "cancelled"
+                        ? previous->error
+                        : std::string();
+                self->history_.complete(historyId, result);
+                auto *entry = self->history_.find(historyId);
+                if (entry && result.cancelled && !cancellationReason.empty()) {
+                    entry->error = cancellationReason;
+                }
+                auto *state = ic ? ic->propertyFor(&self->factory_) : nullptr;
+                if (entry && result.ok && !result.cancelled &&
+                    (!state || result.seq != self->worker_->currentSeq() ||
+                     state->generation != generation || !self->isEligible(ic) ||
+                     self->currentPinyin(ic) != result.pinyin ||
+                     self->buildContext(ic) != context)) {
+                    entry->status = "stale";
+                    entry->error = "Reply no longer matches the current input";
+                }
+                self->refreshHistory();
+            });
         });
+    if (auto *entry = history_.find(historyId)) {
+        entry->seq = state->requestSeq;
+    }
+    refreshHistory();
 }
 
 void ChineseLlm::rememberCandidates(
@@ -652,8 +881,17 @@ void ChineseLlm::insertCandidates(fcitx::InputContext *ic, LlmState *state,
     state->inserting = true;
     // Insert back to front so the first candidate ends up first on screen.
     for (int i = static_cast<int>(toInsert.size()) - 1; i >= 0; i--) {
-        modifiable->insert(position, std::make_unique<LlmCandidateWord>(
-                                         toInsert[i], badge, valid));
+        auto adopted = [owner = watch(), id = state->historyId,
+                        text = toInsert[i]] {
+            if (auto *self = owner.get();
+                self && self->config_.recordHistory.value()) {
+                self->history_.adopt(id, text, false);
+                self->refreshHistory();
+            }
+        };
+        modifiable->insert(position,
+                           std::make_unique<LlmCandidateWord>(
+                               toInsert[i], badge, valid, std::move(adopted)));
     }
     ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
     state->inserting = false;
@@ -706,6 +944,73 @@ void ChineseLlm::refreshStatus() {
         }
         return true;
     });
+}
+
+void ChineseLlm::openHistory(bool launchBrowser) {
+    if (!historySnapshot_.write(
+            renderHistoryHtml(history_, config_.recordHistory.value()))) {
+        FCITX_WARN()
+            << "chinese-llm: unable to create private history snapshot";
+        return;
+    }
+    if (launchBrowser) {
+        // Argument vector, never a shell command or model-controlled URL.
+        startProcess({"xdg-open", historySnapshot_.path()});
+    }
+}
+
+void ChineseLlm::clearHistory() {
+    history_.clear();
+    historySnapshot_.clear();
+    instance_->inputContextManager().foreach([this](InputContext *ic) {
+        auto *state = ic->propertyFor(&factory_);
+        state->historyId = 0;
+        state->commitHistoryId = 0;
+        return true;
+    });
+    refreshHistory();
+}
+
+void ChineseLlm::refreshHistory() {
+    const auto count = history_.entries().size();
+    const auto text = std::vformat(D_("chinese-llm", "LLM request history {0}"),
+                                   std::make_format_args(count));
+    const bool changed = historyAction_.shortText(nullptr) != text;
+    historyAction_.setShortText(text);
+    if (historySnapshot_.exists() &&
+        !historySnapshot_.write(
+            renderHistoryHtml(history_, config_.recordHistory.value()))) {
+        FCITX_WARN()
+            << "chinese-llm: unable to update private history snapshot";
+    }
+    if (changed) {
+        instance_->inputContextManager().foreach([this](InputContext *ic) {
+            if (isLlmInputMethod(ic) &&
+                (ic->hasFocus() || ic == instance_->mostRecentInputContext()) &&
+                ic->statusArea().isChild(&historyAction_)) {
+                historyAction_.update(ic);
+            }
+            return true;
+        });
+    }
+}
+
+bool ChineseLlm::overlapsNative(InputContext *ic,
+                                const std::vector<std::string> &candidates) {
+    const auto list = ic->inputPanel().candidateList();
+    auto *native = list ? list->toModifiable() : nullptr;
+    if (!native) {
+        return false;
+    }
+    for (int i = 0; i < native->totalSize(); ++i) {
+        const auto &word = native->candidateFromAll(i);
+        if (!dynamic_cast<const LlmCandidateWord *>(&word) &&
+            std::ranges::find(candidates, word.text().toString()) !=
+                candidates.end()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ChineseLlm::compareNativeCandidates(

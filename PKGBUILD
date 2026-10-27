@@ -2,13 +2,13 @@
 # Run makepkg from this checkout, or set CHINESE_LLM_SOURCE_DIR to it.
 # prepare() includes uncommitted source files in a fresh, isolated snapshot.
 pkgname=chinese-llm-addons
-pkgver=5.1.15.local.haff9c02352c347db
+pkgver=5.1.15.local.h37bc548cce9c5355
 pkgrel=1
 pkgdesc='Independent LLM Pinyin input method for Fcitx5 (keeps official Chinese addons)'
 arch=('x86_64')
 url='https://github.com/Sherlock-Holo/chinese-llm-addons'
 license=('LGPL-2.1-or-later')
-depends=('fcitx5>=5.1.22' 'libime>=1.1.14' 'curl' 'gcc-libs' 'glibc')
+depends=('fcitx5>=5.1.22' 'libime>=1.1.14' 'curl' 'gcc-libs' 'glibc' 'xdg-utils')
 makedepends=('cmake>=3.12' 'ninja' 'nlohmann-json' 'pkgconf' 'boost' 'python>=3.8' 'gettext')
 options=('!debug')
 # No provides/conflicts/replaces for fcitx5-chinese-addons or fcitx.
@@ -37,7 +37,8 @@ prepare() {
     modules/chinese-llm/chinese-llm.h modules/chinese-llm/chinese-llm.conf.in.in \
     modules/chinese-llm/llmbackend.cpp modules/chinese-llm/llmbackend.h \
     modules/chinese-llm/llmworker.cpp modules/chinese-llm/llmworker.h \
-    test/CMakeLists.txt test/testdir.h.in test/addon/CMakeLists.txt \
+    modules/chinese-llm/llmhistory.cpp modules/chinese-llm/llmhistory.h \
+    test/testllmhistory.cpp test/CMakeLists.txt test/testdir.h.in test/addon/CMakeLists.txt \
     test/testllmbackend.cpp test/testllmconfig.cpp test/testllmworker.cpp \
     test/testllmaddon.cpp scripts/smoke.sh scripts/mock_server.py \
     modules/chinese-llm/native/CMakeLists.txt modules/chinese-llm/native/generate.py \
@@ -152,7 +153,7 @@ check() {
   _snapshot_root || return 1
   # Deterministic, network-free tests; no real model or user's Fcitx session.
   ctest --test-dir "$_snapshot/build" --output-on-failure \
-    -R '^testllm(backend|config|config-zh_CN|config-en)$'
+    -R '^testllm(backend|history|config|config-zh_CN|config-en)$'
 }
 
 package() {

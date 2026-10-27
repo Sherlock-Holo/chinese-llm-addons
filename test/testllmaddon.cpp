@@ -42,7 +42,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace fcitx;
@@ -53,6 +55,29 @@ constexpr char kLlmInputMethod[] = "llm-pinyin";
 constexpr char kKeys[] = "tamenzhengzaikaihui";
 constexpr char kModelWord[] = "她们正在开会";
 constexpr char kOtherWord[] = "它们正在开会";
+constexpr char kContextBefore[] = "safe-context-before";
+constexpr char kContextAfter[] = "safe-context-after";
+const std::map<std::string, std::pair<std::string, std::string>> payloadScenarios{
+    {"mixed", {"bang'wo'push'yi'xia", "帮我push一下"}},
+    {"mixed-badge-off", {"bang'wo'push'yi'xia", "帮我push一下"}},
+    {"mixed-contiguous-surrounding", {"bangwocommityixia", "帮我commit一下"}},
+    {"mixed-contiguous-surrounding-inflight",
+     {"bangwocommityixia", "帮我commit一下"}},
+    {"mixed-contiguous-surrounding-visible",
+     {"bangwocommityixia", "帮我commit一下"}},
+    {"mixed-context-changed", {"bangwocommityixia", "帮我commit一下"}},
+    {"mixed-contiguous-commit", {"bangwocommityixia", "帮我commit一下"}},
+    {"mixed-contiguous-commit-blocked",
+     {"bangwocommityixia", "帮我commit一下"}},
+    {"english", {"ying'wen", "Hello, world! C++ C#"}},
+    {"digits", {"shu'zi", "2026"}},
+    {"emoji",
+     {"biao'qing",
+      "😀 ☀\uFE0F ☁\uFE0E 👍🏽 👩\u200D💻 👨\u200D👩\u200D👧\u200D👦 "
+      "🇨🇳 1\uFE0F\u20E3 #\uFE0F\u20E3 *\u20E3"}},
+    {"emoji-tag",
+     {"qi'zi", "\U0001F3F4\U000E0067\U000E0062\U000E0065\U000E006E"
+               "\U000E0067\U000E007F"}}};
 using Clock = std::chrono::steady_clock;
 
 bool hasCandidate(InputContext *ic, const std::string &word) {
@@ -83,7 +108,7 @@ void selectCandidate(InputContext *ic, const std::string &word) {
     throw std::runtime_error("candidate not found: " + word);
 }
 
-size_t mockRequestCount(const std::string &endpoint) {
+nlohmann::json mockStats(const std::string &endpoint) {
     const auto path = endpoint.find('/', endpoint.find("://") + 3);
     const auto url = endpoint.substr(0, path) + "/stats";
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(),
@@ -106,7 +131,11 @@ size_t mockRequestCount(const std::string &endpoint) {
     if (curl_easy_perform(curl.get()) != CURLE_OK) {
         throw std::runtime_error("mock stats unavailable");
     }
-    return nlohmann::json::parse(body).at("count").get<size_t>();
+    return nlohmann::json::parse(body);
+}
+
+size_t mockRequestCount(const std::string &endpoint) {
+    return mockStats(endpoint).at("count").get<size_t>();
 }
 
 // Called only inside a main-thread callback after synchronous dispatch with
@@ -144,6 +173,51 @@ void require(bool condition, const std::string &message) {
         throw std::runtime_error(message);
     }
 }
+std::string normalizedTypedKeys(const std::string &text) {
+    std::string result;
+    for (char c : text) {
+        if (c != ' ' && c != '\'') {
+            result.push_back(c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c);
+        }
+    }
+    return result;
+}
+
+void dumpComposition(InputContext *ic, const std::string &phase,
+                     const std::string &keys, bool accepted) {
+    const auto *composition = ic->propertyAs<LlmState>("chinese-llm");
+    const auto list = ic->inputPanel().candidateList();
+    const auto *bulk = list ? list->toBulk() : nullptr;
+    const auto *common = dynamic_cast<const CommonCandidateList *>(list.get());
+    nlohmann::json diagnostic{
+        {"phase", phase},
+        {"typed_keys", keys},
+        {"key_accepted", accepted},
+        {"focused", ic->hasFocus()},
+        {"preedit", ic->inputPanel().preedit().toString()},
+        {"client_preedit", ic->inputPanel().clientPreedit().toString()},
+        {"state_pinyin", composition->pinyin},
+        {"generation", composition->generation},
+        {"request_seq", composition->requestSeq},
+        {"debounce_present", static_cast<bool>(composition->debounce)},
+        {"debounce_enabled", composition->debounce &&
+                                 composition->debounce->isEnabled()},
+        {"native_list_present", static_cast<bool>(list)},
+        {"native_list_empty", !list || list->empty()},
+        {"native_list_modifiable", list && list->toModifiable()},
+        {"candidate_count", bulk ? bulk->totalSize() : -1},
+        {"origin_count", common ? common->originSize() : -1},
+        {"model_candidates", composition->candidates}};
+    std::vector<std::string> firstWords;
+    if (bulk) {
+        for (int i = 0; i < std::min(bulk->totalSize(), 3); ++i) {
+            firstWords.push_back(bulk->candidateFromAll(i).text().toString());
+        }
+    }
+    diagnostic["first_candidates"] = firstWords;
+    std::cout << "composition-diagnostic: " << diagnostic.dump() << std::endl;
+}
+
 std::string configValue(const Configuration *config, const std::string &path) {
     require(config, "missing configuration for " + path);
     RawConfig saved;
@@ -241,6 +315,32 @@ std::string readTestData(const std::filesystem::path &path) {
     return std::string(std::istreambuf_iterator<char>(stream), {});
 }
 
+void checkPrivateSnapshot(const std::string &snapshot) {
+    require(!snapshot.empty(), "history snapshot path is empty after viewing");
+    const std::filesystem::path path(snapshot);
+    struct stat fileStat {}, directoryStat {};
+    require(::lstat(path.c_str(), &fileStat) == 0 &&
+                ::lstat(path.parent_path().c_str(), &directoryStat) == 0 &&
+                S_ISREG(fileStat.st_mode) && S_ISDIR(directoryStat.st_mode) &&
+                (fileStat.st_mode & 0777) == 0600 &&
+                (directoryStat.st_mode & 0777) == 0700 &&
+                fileStat.st_uid == ::geteuid() &&
+                directoryStat.st_uid == ::geteuid(),
+            "history snapshot must be owned 0600 file inside owned 0700 dir");
+}
+
+std::filesystem::path openerLogPath() {
+    const char *path = std::getenv("FCITX_TEST_HISTORY_OPENER_LOG");
+    require(path && *path, "history menu test requires isolated xdg-open stub");
+    return path;
+}
+
+bool openerRecorded() {
+    const auto path = openerLogPath();
+    return std::filesystem::exists(path) &&
+           nlohmann::json::parse(readTestData(path), nullptr, false).is_object();
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -258,6 +358,18 @@ int main(int argc, char **argv) {
         }
     }
     const std::vector<std::string> scenarios{"live",
+                                             "mixed",
+                                             "mixed-badge-off",
+                                             "mixed-contiguous-surrounding",
+                                             "mixed-contiguous-surrounding-inflight",
+                                             "mixed-contiguous-surrounding-visible",
+                                             "mixed-context-changed",
+                                             "mixed-contiguous-commit",
+                                             "mixed-contiguous-commit-blocked",
+                                             "english",
+                                             "digits",
+                                             "emoji",
+                                             "emoji-tag",
                                              "debounce",
                                              "disabled",
                                              "dead",
@@ -300,11 +412,21 @@ int main(int argc, char **argv) {
                                              "stats-all-filtered",
                                              "stats-limit",
                                              "stats-rate",
-                                             "stats-focus"};
+                                             "stats-focus",
+                                             "history-menu",
+                                             "history-disabled",
+                                             "history-disable-live",
+                                             "history-privacy",
+                                             "history-stale",
+                                             "history-native-blocked"};
     if (std::ranges::find(scenarios, scenario) == scenarios.end()) {
         std::cerr << "unknown scenario: " << scenario << '\n';
         return EXIT_FAILURE;
     }
+    const auto payloadScenario = payloadScenarios.find(scenario);
+    const bool payload = payloadScenario != payloadScenarios.end();
+    const bool contiguousPayload = scenario.starts_with("mixed-contiguous-") ||
+                                   scenario == "mixed-context-changed";
     Log::setLogRule("default=3,chinese-llm=4");
     char arg0[] = "testllmaddon";
     char arg1[] = "--disable=all";
@@ -354,6 +476,8 @@ int main(int argc, char **argv) {
     int retainedModelIndex = -1;
     std::string officialConfigBefore;
     std::string shuangpinConfigBefore;
+    std::string viewedSnapshot;
+    uint64_t contextChangedGeneration = 0;
     const InputMethodEntry *officialEntry = nullptr;
     const InputMethodEntry *shuangpinEntry = nullptr;
     InputMethodEngine *officialEngine = nullptr;
@@ -437,6 +561,27 @@ int main(int argc, char **argv) {
                         "statistics menu visibility leaked/lost across IMs");
             }
         }
+        for (const auto *id : {"chinese-llm-history",
+                               "chinese-llm-history-clear"}) {
+            auto *action = instance.userInterfaceManager().lookupAction(id);
+            require(action && dynamic_cast<SimpleAction *>(action) &&
+                        !action->isCheckable() && action->hotkey().empty(),
+                    "history menu action is missing or changes toggle state");
+            if (ic) {
+                require(ic->statusArea().isChild(action) ==
+                            ic->statusArea().isChild(actions.front()),
+                        "history menu visibility leaked into official input "
+                        "method or vanished from LLM input method");
+            }
+        }
+        auto *historyAction = instance.userInterfaceManager().lookupAction(
+            "chinese-llm-history");
+        const auto historyCount =
+            std::to_string(llmAddon->requestHistory().entries().size());
+        const auto historyLabel = historyAction->shortText(ic);
+        require(historyLabel == "LLM request history " + historyCount ||
+                    historyLabel == "LLM 请求历史 " + historyCount,
+                "history menu count is not synchronized with retained rows");
     };
     auto clickStatistics = [&]() {
         const auto before = llmAddon->requestStatistics();
@@ -470,6 +615,24 @@ int main(int argc, char **argv) {
             "read-only statistics click changed configuration/composition/UI");
     };
     auto finish = [&](bool success, const std::string &message) {
+        if (contiguousPayload && ic && llmAddon) {
+            dumpComposition(ic, success ? "scenario-success" : "scenario-failure",
+                            payloadScenario->second.first, true);
+            for (const auto &entry : llmAddon->requestHistory().entries()) {
+                std::cout << "request-diagnostic: "
+                          << nlohmann::json{{"id", entry.id},
+                                            {"seq", entry.seq},
+                                            {"pinyin", entry.pinyin},
+                                            {"status", entry.status},
+                                            {"http_status", entry.httpStatus},
+                                            {"elapsed_ms", entry.elapsedMs},
+                                            {"content", entry.content},
+                                            {"candidates", entry.candidates},
+                                            {"error", entry.error}}
+                                 .dump()
+                          << std::endl;
+            }
+        }
         if (success) {
             struct ExpectedStatistics {
                 uint64_t sent;
@@ -478,6 +641,18 @@ int main(int argc, char **argv) {
             };
             const std::map<std::string, ExpectedStatistics> expected{
                 {"live", {1, 1, 1}},
+                {"mixed", {1, 1, 0}},
+                {"mixed-badge-off", {1, 1, 0}},
+                {"mixed-contiguous-surrounding", {1, 1, 0}},
+                {"mixed-contiguous-surrounding-inflight", {1, 1, 0}},
+                {"mixed-contiguous-surrounding-visible", {1, 1, 0}},
+                {"mixed-context-changed", {1, 1, 0}},
+                {"mixed-contiguous-commit", {1, 1, 0}},
+                {"mixed-contiguous-commit-blocked", {1, 1, 0}},
+                {"english", {1, 1, 0}},
+                {"digits", {1, 1, 0}},
+                {"emoji", {1, 1, 0}},
+                {"emoji-tag", {1, 1, 0}},
                 {"debounce", {1, 1, 1}},
                 {"disabled", {0, 0, 0}},
                 {"dead", {1, 0, 0}},
@@ -520,9 +695,148 @@ int main(int argc, char **argv) {
                 {"stats-all-filtered", {1, 0, 0}},
                 {"stats-limit", {1, 1, 1}},
                 {"stats-rate", {3, 3, 2}},
-                {"stats-focus", {2, 0, 0}}};
+                {"stats-focus", {2, 0, 0}},
+                {"history-menu", {1, 1, 1}},
+                {"history-disabled", {1, 1, 1}},
+                {"history-disable-live", {1, 1, 1}},
+                {"history-privacy", {2, 1, 1}},
+                {"history-stale", {1, 0, 0}},
+                {"history-native-blocked", {1, 1, 1}}};
             const auto &counts = expected.at(scenario);
             checkStatistics(counts.sent, counts.compared, counts.overlapping);
+            const auto &entries = llmAddon->requestHistory().entries();
+            require(entries.size() <= 100 &&
+                        llmAddon->historySnapshotPath().empty(),
+                    "history exceeded its bound or implicitly wrote a "
+                    "snapshot outside an explicit view");
+            uint64_t previousId = 0;
+            for (const auto &entry : entries) {
+                require(entry.id > previousId && entry.timestampMs > 0 &&
+                            !entry.pinyin.empty() && !entry.model.empty(),
+                        "history rows lost identity, timestamp, keys or model");
+                previousId = entry.id;
+                require(entry.content.find("private-context-never-record") ==
+                                std::string::npos &&
+                            entry.error.find("history-private-key-sentinel") ==
+                                std::string::npos,
+                        "history retained request context or credentials");
+            }
+            auto entryWithStatus = [&](const std::string &status)
+                -> const fcitx::chinesellm::RequestHistoryEntry & {
+                for (const auto &entry : entries) {
+                    if (entry.status == status) {
+                        return entry;
+                    }
+                }
+                throw std::runtime_error("missing history status: " + status);
+            };
+            if (payload || scenario == "live" || scenario == "debounce" ||
+                scenario == "badge-off" || scenario == "cloud-badge") {
+                const auto &entry = entryWithStatus("usable");
+                require(entries.size() == 1 && entry.started &&
+                            entry.httpStatus == 200 && entry.seq != 0 &&
+                            entry.elapsedMs >= 100 && !entry.content.empty() &&
+                            !entry.candidates.empty() &&
+                            entry.overlap == (counts.overlapping != 0) &&
+                            entry.adoption == "llm" &&
+                            entry.adoptedText ==
+                                (payload ? payloadScenario->second.second
+                                         : kModelWord),
+                        "usable history lost timing/http/raw/overlap/LLM "
+                        "adoption data");
+            } else if (scenario == "stats-overlap" ||
+                       scenario == "history-native-blocked") {
+                const auto &entry = entryWithStatus("usable");
+                require(entry.overlap == true && entry.adoption == "native" &&
+                            entry.adoptedText == "你好",
+                        "native equivalent candidate adoption was not recorded "
+                        "separately from LLM selection");
+            } else if (scenario == "stats-empty") {
+                const auto &entry = entryWithStatus("empty");
+                require(entry.started && entry.httpStatus == 200 &&
+                            entry.content.empty() && entry.candidates.empty() &&
+                            !entry.overlap.has_value(),
+                        "empty completion history fields are wrong");
+            } else if (scenario == "stats-error" ||
+                       scenario == "stats-invalid" || scenario == "dead") {
+                const auto &entry = entryWithStatus("error");
+                require(entry.started && !entry.error.empty() &&
+                            entry.candidates.empty() &&
+                            !entry.overlap.has_value() &&
+                            entry.httpStatus == (scenario == "stats-error"
+                                                     ? 500
+                                                     : scenario == "dead" ? 0
+                                                                          : 200),
+                        "error history lost transport/http/error information");
+            } else if (scenario == "stats-all-filtered") {
+                const auto &entry = entryWithStatus("filtered");
+                require(entry.started && entry.httpStatus == 200 &&
+                            !entry.content.empty() && entry.candidates.empty() &&
+                            !entry.overlap.has_value(),
+                        "filtered history lost raw completion or status");
+                for (const auto *reason : {"key_echo", "han_length_mismatch",
+                                          "invalid_text",
+                                          "empty_or_punctuation"}) {
+                    require(std::ranges::any_of(
+                                entry.rejected,
+                                [&](const auto &rejected) {
+                                    return rejected.reason == reason &&
+                                           !rejected.text.empty();
+                                }),
+                            std::string("filtered history lacks reason/text: ") +
+                                reason);
+                }
+            } else if (scenario == "stats-limit") {
+                const auto &entry = entryWithStatus("usable");
+                require(entry.candidates ==
+                            std::vector<std::string>{kModelWord,
+                                                     "他们正在开会", kOtherWord} &&
+                            entry.content.find("他们正在开会。") !=
+                                std::string::npos &&
+                            entry.overlap == true,
+                        "history lost raw punctuation/full sanitized result "
+                        "before display limit");
+            } else if (scenario == "cache") {
+                const auto &hit = entryWithStatus("cache_hit");
+                require(entries.size() == 3 && &hit == &entries.back() &&
+                            !hit.started && hit.httpStatus == 0 &&
+                            hit.candidates == entries.front().candidates &&
+                            counts.sent == 2 && counts.compared == 2,
+                        "cache history was omitted or counted as a transfer");
+            } else if (scenario == "reset" ||
+                       scenario == "switch-inflight" ||
+                       scenario == "toggle-inflight") {
+                const auto &cancelled = entryWithStatus("cancelled");
+                require(cancelled.started && cancelled.adoption.empty() &&
+                            !cancelled.overlap.has_value(),
+                        "cancelled history was lost, compared or adopted");
+            } else if (scenario == "stats-focus") {
+                require(std::ranges::any_of(entries, [](const auto &entry) {
+                            return entry.status == "cancelled" &&
+                                   entry.error == "focus_lost";
+                        }),
+                        "worker cancellation overwrote the exact focus_lost "
+                        "history cause");
+            } else if (scenario == "history-stale") {
+                const auto &stale = entryWithStatus("stale");
+                require(stale.started && stale.httpStatus == 200 &&
+                            !stale.content.empty() && stale.adoption.empty() &&
+                            !stale.overlap.has_value() &&
+                            ic->propertyAs<LlmState>("chinese-llm")
+                                ->candidates.empty(),
+                        "stale result was dropped from history or exposed "
+                        "to candidates/statistics");
+            }
+            if (scenario == "sensitive" ||
+                scenario == "sensitive-inflight" ||
+                scenario == "history-privacy" ||
+                scenario == "history-disabled" ||
+                scenario == "history-disable-live" ||
+                scenario == "history-menu" || original || counts.sent == 0) {
+                require(entries.empty(),
+                        "disabled/cleared/sensitive/official path retained "
+                        "request history");
+            }
         }
         if (success && officialEngine && officialEntry && shuangpinEntry) {
             require(
@@ -566,9 +880,26 @@ int main(int argc, char **argv) {
         instance.exit();
     };
     auto type = [&](const std::string &keys) {
+        std::string prefix;
         for (char c : keys) {
-            frontend->call<ITestFrontend::sendKeyEvent>(
-                uuid, Key(std::string(1, c)), false);
+            bool accepted;
+            if (scenario == "mixed-contiguous-commit-blocked") {
+                InputContextEventBlocker blocker(ic);
+                accepted = frontend->call<ITestFrontend::sendKeyEvent>(
+                    uuid, Key(std::string(1, c)), false);
+            } else {
+                accepted = frontend->call<ITestFrontend::sendKeyEvent>(
+                    uuid, Key(std::string(1, c)), false);
+            }
+            prefix.push_back(c);
+            if (contiguousPayload) {
+                dumpComposition(ic, keys == payloadScenario->second.first
+                                        ? "initial-key"
+                                        : "post-commit-key",
+                                prefix, accepted);
+                require(accepted, "contiguous mixed key was not accepted: " +
+                                      prefix);
+            }
         }
     };
     auto state = [&]() { return ic->propertyAs<LlmState>("chinese-llm"); };
@@ -719,7 +1050,10 @@ int main(int argc, char **argv) {
                                ? "False"
                                : "True");
             config.setValueByPath("ShowBadge",
-                                  scenario == "badge-off" ? "False" : "True");
+                                  scenario == "badge-off" ||
+                                          scenario == "mixed-badge-off"
+                                      ? "False"
+                                      : "True");
             config.setValueByPath("CandidateIndex",
                                   scenario == "cloud-badge" ? "1" : "2");
             if (scenario == "stats-limit") {
@@ -727,14 +1061,28 @@ int main(int argc, char **argv) {
                 config.setValueByPath("ShowBadge", "False");
             }
             config.setValueByPath("Model", "mock");
-            config.setValueByPath("ApiKey", "");
+            config.setValueByPath("ApiKey", scenario == "history-privacy"
+                                                ? "history-private-key-sentinel"
+                                                : "");
+            config.setValueByPath("RecordHistory",
+                                  scenario == "history-disabled" ? "False"
+                                                                  : "True");
             config.setValueByPath("DebounceMs", "250");
             config.setValueByPath("TimeoutSeconds", "1");
             config.setValueByPath("PromptTemplate", "{context}\n{pinyin}");
-            config.setValueByPath("ContextLength", "2");
+            config.setValueByPath(
+                "ContextLength",
+                scenario == "history-privacy" ||
+                        scenario == "mixed-contiguous-surrounding-visible" ||
+                        scenario == "mixed-context-changed"
+                    ? "64"
+                    : scenario.starts_with("mixed-contiguous-surrounding")
+                          ? "0"
+                          : "2");
             config.setValueByPath("CacheSize",
                                   scenario == "cache" || scenario == "config" ||
-                                          scenario == "switch-results"
+                                          scenario == "switch-results" ||
+                                          scenario == "history-menu"
                                       ? "256"
                                       : "0");
             config.setValueByPath("MaxConsecutiveErrors", "2");
@@ -1300,6 +1648,27 @@ int main(int argc, char **argv) {
                         "global shortcut probe did not restore independent "
                         "LLM拼音");
             }
+            require(llmAddon->requestHistory().entries().empty() &&
+                        llmAddon->historySnapshotPath().empty(),
+                    "history must start empty and must not create a snapshot "
+                    "before the user views it");
+            if (scenario.starts_with("mixed-contiguous-surrounding") ||
+                scenario == "mixed-context-changed") {
+                const std::string context =
+                    scenario == "mixed-contiguous-surrounding-visible" ||
+                            scenario == "mixed-context-changed"
+                        ? kContextBefore
+                        : "safe-context";
+                ic->surroundingText().setText(context, context.size(),
+                                              context.size());
+                ic->updateSurroundingText();
+            }
+            if (scenario == "history-privacy") {
+                const std::string context = "private-context-never-record";
+                ic->surroundingText().setText(context, context.size(),
+                                              context.size());
+                ic->updateSurroundingText();
+            }
             if (scenario == "context" || scenario == "cache" ||
                 scenario == "stats-rate") {
                 ic->surroundingText().setText("甲乙丙丁戊", 3, 3);
@@ -1321,8 +1690,87 @@ int main(int argc, char **argv) {
                     require(event.accepted(),
                             "LLM engine did not delegate virtual keyboard key");
                 }
+            } else if (payload) {
+                type(payloadScenario->second.first);
+                if (contiguousPayload) {
+                    dumpComposition(ic, "complete-input",
+                                    payloadScenario->second.first, true);
+                    require(
+                        !preeditText(ic).empty() &&
+                            normalizedTypedKeys(preeditText(ic)) ==
+                                payloadScenario->second.first &&
+                            !state()->pinyin.empty() &&
+                            normalizedTypedKeys(state()->pinyin) ==
+                                payloadScenario->second.first,
+                        "complete contiguous input lost native preedit or "
+                        "LLM state before final request: preedit=" +
+                            preeditText(ic) + " state=" + state()->pinyin);
+                }
+                if (scenario == "mixed-contiguous-surrounding" ||
+                    scenario == "mixed-contiguous-surrounding-inflight") {
+                    const bool inFlight =
+                        scenario == "mixed-contiguous-surrounding-inflight";
+                    if (inFlight) {
+                        RawConfig immediate;
+                        immediate.setValueByPath("DebounceMs", "0");
+                        llm->setConfig(immediate);
+                        ic->updateUserInterface(
+                            UserInterfaceComponent::InputPanel);
+                        waitForMockRequests(endpoint, 1);
+                    }
+                    const auto oldPinyin = state()->pinyin;
+                    const auto oldContext = state()->context;
+                    const auto oldGeneration = state()->generation;
+                    const auto oldSeq = state()->requestSeq;
+                    const auto *oldDebounce = state()->debounce.get();
+                    const bool oldEnabled = oldDebounce &&
+                                            oldDebounce->isEnabled();
+                    require(oldContext.empty() &&
+                                (inFlight ? oldSeq != 0
+                                          : oldDebounce && oldEnabled),
+                            "same-context probe must start with an in-flight "
+                            "request/pending debounce and ContextLength=0");
+                    // DBus frontends notify even if both surrounding text and
+                    // cursor are unchanged. ContextLength=0 also guarantees the
+                    // effective model context did not change.
+                    ic->updateSurroundingText();
+                    dumpComposition(ic, "same-surrounding-notification",
+                                    payloadScenario->second.first, true);
+                    require(
+                        state()->pinyin == oldPinyin &&
+                            state()->context == oldContext &&
+                            state()->generation == oldGeneration &&
+                            state()->requestSeq == oldSeq &&
+                            state()->debounce.get() == oldDebounce &&
+                            (!oldDebounce ||
+                             state()->debounce->isEnabled() == oldEnabled),
+                        "unchanged surrounding-text notification invalidated "
+                        "the complete input/final debounce");
+                }
+                if (scenario == "mixed-context-changed") {
+                    require(state()->context == kContextBefore &&
+                                state()->debounce &&
+                                state()->debounce->isEnabled() &&
+                                state()->requestSeq == 0,
+                            "changed-context probe must start before dispatch "
+                            "with the old effective context");
+                    contextChangedGeneration = state()->generation;
+                    const std::string context = kContextAfter;
+                    ic->surroundingText().setText(context, context.size(),
+                                                  context.size());
+                    // No explicit updateUserInterface here: a true context
+                    // change must automatically retry the same complete keys.
+                    ic->updateSurroundingText();
+                    dumpComposition(ic, "effective-context-changed",
+                                    payloadScenario->second.first, true);
+                }
+                require(!preeditText(ic).empty() &&
+                            !hasCandidate(ic, payloadScenario->second.second),
+                        "payload scenario must start with native composition "
+                        "and no model candidate");
             } else {
-                type(originalPinyin || scenario == "stats-overlap" ? "nihao"
+                type(originalPinyin || scenario == "stats-overlap" ||
+                             scenario == "history-native-blocked" ? "nihao"
                      : originalShuangpin                           ? "nihk"
                                                                    : kKeys);
             }
@@ -1346,6 +1794,17 @@ int main(int argc, char **argv) {
                 dormantActionBefore = dormantActionUpdates;
             }
             generation = state()->generation;
+            if (scenario == "history-stale") {
+                RawConfig immediate;
+                immediate.setValueByPath("DebounceMs", "0");
+                llm->setConfig(immediate);
+                ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+                waitForMockRequests(endpoint, 1);
+                // Deterministically expire only the composition version, without
+                // cancelling the real HTTP transfer. This isolates the main-
+                // thread stale guard; the real reset scenario tests cancellation.
+                ++state()->generation;
+            }
             if (scenario == "disabled" || scenario == "dead") {
                 require(
                     !preeditText(ic).empty() &&
@@ -1416,7 +1875,493 @@ int main(int argc, char **argv) {
                         require(elapsed < std::chrono::seconds(8),
                                 "scenario deadline exceeded");
                         const bool appeared = hasCandidate(ic, kModelWord);
-                        if (scenario == "stats-focus") {
+                        if (scenario == "history-native-blocked") {
+                            const auto &entries =
+                                llmAddon->requestHistory().entries();
+                            if (stage == 0 &&
+                                llmAddon->requestStatistics().compared == 1) {
+                                const auto list =
+                                    ic->inputPanel().candidateList();
+                                require(list && !list->empty() &&
+                                            list->candidate(0)
+                                                    .text()
+                                                    .toString() == "你好" &&
+                                            list->candidate(0)
+                                                .comment()
+                                                .toString()
+                                                .find("\u2601") ==
+                                                std::string::npos &&
+                                            entries.size() == 1 &&
+                                            entries.back().adoption.empty(),
+                                        "blocked adoption probe requires "
+                                        "unadopted native first candidate");
+                                frontend->call<
+                                    ITestFrontend::pushCommitExpectation>(
+                                    "你好");
+                                {
+                                    // Real frontends queue client-facing commits
+                                    // until the key-event blocker is destroyed.
+                                    InputContextEventBlocker blocker(ic);
+                                    require(frontend->call<
+                                                ITestFrontend::sendKeyEvent>(
+                                                uuid, Key("space"), false),
+                                            "native Space selection was not "
+                                            "accepted under frontend blocker");
+                                    require(preeditText(ic).empty() &&
+                                                state()->pinyin.empty() &&
+                                                state()->candidates.empty(),
+                                            "native selection did not reset "
+                                            "composition before queued commit");
+                                    ic->updateUserInterface(
+                                        UserInterfaceComponent::InputPanel);
+                                }
+                                stage = 1;
+                            }
+                            if (stage == 1 && !entries.empty() &&
+                                entries.back().adoption == "native") {
+                                require(entries.back().adoptedText == "你好",
+                                        "queued native commit lost exact "
+                                        "adopted text");
+                                type("shui");
+                                require(preeditText(ic) == "shui",
+                                        "blocked native selection retained "
+                                        "old composition");
+                                ic->reset();
+                                finish(true, "");
+                            }
+                        } else if (scenario == "history-stale") {
+                            require(!appeared && state()->candidates.empty(),
+                                    "version-expired result appeared in UI");
+                            const auto &entries =
+                                llmAddon->requestHistory().entries();
+                            if (!entries.empty() &&
+                                entries.back().status == "stale") {
+                                finish(true, "");
+                            }
+                        } else if (scenario == "history-menu") {
+                            auto *view =
+                                instance.userInterfaceManager().lookupAction(
+                                    "chinese-llm-history");
+                            auto *clear =
+                                instance.userInterfaceManager().lookupAction(
+                                    "chinese-llm-history-clear");
+                            if (stage == 0 && appeared) {
+                                require(
+                                    llmAddon->historySnapshotPath().empty() &&
+                                        !std::filesystem::exists(
+                                            openerLogPath()),
+                                    "history wrote/launched before explicit "
+                                    "menu activation");
+                                const auto list =
+                                    ic->inputPanel().candidateList();
+                                const auto preedit = preeditText(ic);
+                                const auto seq = state()->requestSeq;
+                                const auto version = state()->generation;
+                                view->activate(nullptr);
+                                require(llmAddon->historySnapshotPath().empty(),
+                                        "null history menu click wrote a "
+                                        "snapshot");
+                                view->activate(ic);
+                                viewedSnapshot =
+                                    llmAddon->historySnapshotPath();
+                                checkPrivateSnapshot(viewedSnapshot);
+                                const auto html = readTestData(viewedSnapshot);
+                                require(
+                                    html.find("history-html-marker") !=
+                                            std::string::npos &&
+                                        html.find("&lt;script&gt;") !=
+                                            std::string::npos &&
+                                        html.find("<script>") ==
+                                            std::string::npos &&
+                                        html.find("invalid_text") !=
+                                            std::string::npos &&
+                                        html.find("key_echo") !=
+                                            std::string::npos &&
+                                        html.find(kModelWord) !=
+                                            std::string::npos,
+                                    "HTML snapshot lost raw/reasons/candidates "
+                                    "or executed model HTML");
+                                require(
+                                    ic->inputPanel().candidateList() == list &&
+                                        preeditText(ic) == preedit &&
+                                        state()->requestSeq == seq &&
+                                        state()->generation == version,
+                                    "viewing history changed composition");
+                                checkStatistics(1, 1, 1);
+                                stage = 1;
+                            } else if (stage == 1 && openerRecorded()) {
+                                const auto opener = nlohmann::json::parse(
+                                    readTestData(openerLogPath()));
+                                require(opener.at("args").size() == 1 &&
+                                            opener.at("path").get<std::string>() ==
+                                                viewedSnapshot &&
+                                            opener.at("file_mode") == 0600 &&
+                                            opener.at("directory_mode") == 0700,
+                                        "menu did not invoke isolated opener "
+                                        "with private snapshot path");
+                                const auto beforeAdoption =
+                                    readTestData(viewedSnapshot);
+                                frontend->call<
+                                    ITestFrontend::pushCommitExpectation>(
+                                    kModelWord);
+                                selectCandidate(ic, kModelWord);
+                                require(
+                                    llmAddon->requestHistory()
+                                                .entries()
+                                                .back()
+                                                .adoption == "llm" &&
+                                        readTestData(viewedSnapshot) !=
+                                            beforeAdoption,
+                                    "adoption did not refresh already-viewed "
+                                    "snapshot");
+                                type(kKeys);
+                                const auto &entries =
+                                    llmAddon->requestHistory().entries();
+                                require(hasCandidate(ic, kModelWord) &&
+                                            entries.size() == 2 &&
+                                            entries.back().status ==
+                                                "cache_hit" &&
+                                            !entries.back().started,
+                                        "viewed history missed cache-hit row "
+                                        "or cache failed after commit");
+                                const auto list =
+                                    ic->inputPanel().candidateList();
+                                const auto preedit = preeditText(ic);
+                                const auto pinyin = state()->pinyin;
+                                const auto candidates = state()->candidates;
+                                const auto seq = state()->requestSeq;
+                                const auto version = state()->generation;
+                                auto requireCompositionUnchanged = [&]() {
+                                    require(
+                                        ic->inputPanel().candidateList() ==
+                                                list &&
+                                            preeditText(ic) == preedit &&
+                                            state()->pinyin == pinyin &&
+                                            state()->candidates == candidates &&
+                                            state()->requestSeq == seq &&
+                                            state()->generation == version,
+                                        "history clear/record-only toggle "
+                                        "destroyed current composition");
+                                    checkStatistics(1, 1, 1);
+                                };
+                                clear->activate(nullptr);
+                                require(entries.size() == 2,
+                                        "null clear-history menu click cleared "
+                                        "active history");
+                                clear->activate(ic);
+                                require(
+                                    entries.empty() &&
+                                        llmAddon->historySnapshotPath().empty() &&
+                                        !std::filesystem::exists(
+                                            viewedSnapshot) &&
+                                        !std::filesystem::exists(
+                                            std::filesystem::path(
+                                                viewedSnapshot)
+                                                .parent_path()),
+                                    "clear history retained rows/snapshot/private "
+                                    "directory");
+                                requireCompositionUnchanged();
+                                for (const auto *enabled : {"False", "True"}) {
+                                    RawConfig recording;
+                                    recording.setValueByPath("RecordHistory",
+                                                             enabled);
+                                    llm->setConfig(recording);
+                                    require(entries.empty() &&
+                                                llmAddon->historySnapshotPath()
+                                                    .empty(),
+                                            "record toggle resurrected old "
+                                            "rows or snapshot");
+                                    requireCompositionUnchanged();
+                                }
+                                checkCommit(kModelWord);
+                                finish(true, "");
+                            }
+                        } else if (scenario == "history-disable-live") {
+                            if (stage == 0 && appeared) {
+                                require(
+                                    !llmAddon->requestHistory().entries().empty(),
+                                    "record-disable probe requires a completed "
+                                    "history row");
+                                instance.userInterfaceManager()
+                                    .lookupAction("chinese-llm-history")
+                                    ->activate(ic);
+                                viewedSnapshot =
+                                    llmAddon->historySnapshotPath();
+                                checkPrivateSnapshot(viewedSnapshot);
+                                stage = 1;
+                            } else if (stage == 1 && openerRecorded()) {
+                                const auto list =
+                                    ic->inputPanel().candidateList();
+                                const auto preedit = preeditText(ic);
+                                const auto pinyin = state()->pinyin;
+                                const auto candidates = state()->candidates;
+                                const auto seq = state()->requestSeq;
+                                const auto version = state()->generation;
+                                RawConfig recording;
+                                recording.setValueByPath("RecordHistory",
+                                                         "False");
+                                llm->setConfig(recording);
+                                require(
+                                    llmAddon->requestHistory().entries().empty() &&
+                                        llmAddon->historySnapshotPath().empty() &&
+                                        !std::filesystem::exists(
+                                            viewedSnapshot) &&
+                                        !std::filesystem::exists(
+                                            std::filesystem::path(viewedSnapshot)
+                                                .parent_path()) &&
+                                        ic->inputPanel().candidateList() == list &&
+                                        preeditText(ic) == preedit &&
+                                        state()->pinyin == pinyin &&
+                                        state()->candidates == candidates &&
+                                        state()->requestSeq == seq &&
+                                        state()->generation == version,
+                                    "disabling recording retained private "
+                                    "history or invalidated usable candidates");
+                                checkStatistics(1, 1, 1);
+                                checkCommit(kModelWord);
+                                finish(true, "");
+                            }
+                        } else if (scenario == "history-privacy") {
+                            if (stage == 0 && appeared) {
+                                instance.userInterfaceManager()
+                                .lookupAction("chinese-llm-history")
+                                ->activate(ic);
+                                viewedSnapshot =
+                                    llmAddon->historySnapshotPath();
+                                checkPrivateSnapshot(viewedSnapshot);
+                                const auto html = readTestData(viewedSnapshot);
+                                require(
+                                    html.find("private-context-never-record") ==
+                                            std::string::npos &&
+                                        html.find("history-private-key-sentinel") ==
+                                            std::string::npos &&
+                                        html.find(kModelWord) !=
+                                            std::string::npos,
+                                    "history snapshot leaked context or "
+                                    "credentials");
+                                stage = 1;
+                            } else if (stage == 1 && openerRecorded()) {
+                                ic->reset();
+                                type("ceshi");
+                                stage = 2;
+                            } else if (stage == 2 &&
+                                       mockRequestCount(endpoint) >= 2) {
+                                require(state()->requestSeq != 0,
+                                        "privacy test did not enter second "
+                                        "in-flight request");
+                                ic->setCapabilityFlags(
+                                    CapabilityFlag::PasswordOrSensitive);
+                                require(
+                                    llmAddon->requestHistory().entries().empty() &&
+                                        llmAddon->historySnapshotPath().empty() &&
+                                        !std::filesystem::exists(
+                                            viewedSnapshot) &&
+                                        !std::filesystem::exists(
+                                            std::filesystem::path(
+                                                viewedSnapshot)
+                                                .parent_path()),
+                                    "sensitive input did not immediately erase "
+                                    "memory and viewed snapshot");
+                                stage = 3;
+                                stageStart = Clock::now();
+                            } else if (stage == 3) {
+                                require(
+                                    llmAddon->requestHistory().entries().empty() &&
+                                        llmAddon->historySnapshotPath().empty() &&
+                                        !std::filesystem::exists(viewedSnapshot) &&
+                                        state()->candidates.empty(),
+                                    "late observation resurrected sensitive "
+                                    "history/candidates/snapshot");
+                                if (stageElapsed >
+                                    std::chrono::milliseconds(1000)) {
+                                    finish(true, "");
+                                }
+                            }
+                        } else if (payload) {
+                            const auto &expectedWord =
+                                payloadScenario->second.second;
+                            if (hasCandidate(ic, expectedWord)) {
+                                if (scenario ==
+                                    "mixed-contiguous-surrounding-visible") {
+                                    require(state()->context == kContextBefore,
+                                            "visible same-context probe did not "
+                                            "use effective ContextLength=64");
+                                    const auto oldPinyin = state()->pinyin;
+                                    const auto oldContext = state()->context;
+                                    const auto oldCandidates = state()->candidates;
+                                    const auto oldPreedit = preeditText(ic);
+                                    const auto oldGeneration = state()->generation;
+                                    const auto oldSeq = state()->requestSeq;
+                                    const auto oldList =
+                                        ic->inputPanel().candidateList();
+                                    const auto *oldDebounce =
+                                        state()->debounce.get();
+                                    const bool oldEnabled = oldDebounce &&
+                                                            oldDebounce->isEnabled();
+                                    ic->updateSurroundingText();
+                                    dumpComposition(
+                                        ic, "same-context-visible-notification",
+                                        payloadScenario->second.first, true);
+                                    require(
+                                        state()->pinyin == oldPinyin &&
+                                            state()->context == oldContext &&
+                                            state()->candidates == oldCandidates &&
+                                            preeditText(ic) == oldPreedit &&
+                                            state()->generation == oldGeneration &&
+                                            state()->requestSeq == oldSeq &&
+                                            state()->debounce.get() == oldDebounce &&
+                                            (!oldDebounce ||
+                                             state()->debounce->isEnabled() ==
+                                                 oldEnabled) &&
+                                            ic->inputPanel().candidateList() ==
+                                                oldList &&
+                                            hasCandidate(ic, expectedWord),
+                                        "same effective context erased already "
+                                        "visible candidate or changed seq/gen/timer");
+                                }
+                                if (scenario == "mixed-context-changed") {
+                                    const auto &entries =
+                                        llmAddon->requestHistory().entries();
+                                    require(
+                                        state()->context == kContextAfter &&
+                                            state()->generation >
+                                                contextChangedGeneration &&
+                                            entries.size() == 1 &&
+                                            state()->requestSeq == 0 &&
+                                            entries.back().seq != 0 &&
+                                            entries.back().content.find(
+                                                kContextBefore) ==
+                                                std::string::npos &&
+                                            entries.back().content.find(
+                                                kContextAfter) ==
+                                                std::string::npos &&
+                                            entries.back().error.find(
+                                                kContextAfter) ==
+                                                std::string::npos,
+                                        "context change did not retry current "
+                                        "keys automatically or retained old "
+                                        "request/context history");
+                                }
+                                if (contiguousPayload) {
+                                    const auto &entries =
+                                        llmAddon->requestHistory().entries();
+                                    require(
+                                        !entries.empty() &&
+                                            normalizedTypedKeys(
+                                                entries.back().pinyin) ==
+                                                payloadScenario->second.first &&
+                                            entries.back().status == "usable" &&
+                                            entries.back().started &&
+                                            entries.back().httpStatus == 200 &&
+                                            entries.back().content ==
+                                                expectedWord &&
+                                            normalizedTypedKeys(state()->pinyin) ==
+                                                payloadScenario->second.first,
+                                        "visible mixed candidate lacks a "
+                                        "complete final-input HTTP/history row");
+                                    dumpComposition(
+                                        ic, "final-candidate-visible",
+                                        payloadScenario->second.first, true);
+                                }
+                                checkStatistics(1, 1, 0);
+                                require(
+                                    state()->candidates ==
+                                        std::vector<std::string>{expectedWord},
+                                    "worker/addon changed semantic candidate "
+                                    "bytes or imposed pure-Han length limit");
+                                const bool badge =
+                                    scenario != "mixed-badge-off";
+                                auto checkPayloadBadge = [&]() {
+                                    auto list =
+                                        ic->inputPanel().candidateList();
+                                    auto *bulk = list ? list->toBulk() : nullptr;
+                                    require(bulk,
+                                            "payload has no bulk candidate "
+                                            "list");
+                                    int matches = 0;
+                                    for (int i = 0; i < bulk->totalSize(); ++i) {
+                                        const auto &word =
+                                            bulk->candidateFromAll(i);
+                                        if (word.text().toString() !=
+                                            expectedWord) {
+                                            require(
+                                                word.comment().toString().find(
+                                                    "\u2601") ==
+                                                    std::string::npos,
+                                                "payload cloud badge leaked "
+                                                "into native candidates");
+                                            continue;
+                                        }
+                                        ++matches;
+                                        require(
+                                            word.comment().toString() ==
+                                                (badge ? "\u2601\uFE0E" : ""),
+                                            "payload badge was lost or "
+                                            "included in semantic text");
+                                        const auto displayed =
+                                            instance
+                                                .outputFilter(
+                                                    ic,
+                                                    word.textWithComment(
+                                                        word.spaceBetweenComment()
+                                                            ? " "
+                                                            : ""))
+                                                .toString();
+                                        require(
+                                            displayed ==
+                                                expectedWord +
+                                                    (badge
+                                                         ? " \u2601\uFE0E"
+                                                         : ""),
+                                            "display filtering changed "
+                                            "English/emoji/punctuation bytes");
+                                    }
+                                    require(matches == 1,
+                                            "payload candidate duplicated "
+                                            "during UI refresh");
+                                };
+                                checkPayloadBadge();
+                                ic->updateUserInterface(
+                                    UserInterfaceComponent::InputPanel);
+                                checkPayloadBadge();
+                                clickStatistics();
+                                const auto oldGeneration = state()->generation;
+                                // The real frontend expectation compares the
+                                // entire commit string byte-for-byte, including
+                                // spaces, VS, ZWJ, modifiers and tag characters.
+                                frontend->call<
+                                    ITestFrontend::pushCommitExpectation>(
+                                    expectedWord);
+                                selectCandidate(ic, expectedWord);
+                                require(
+                                    ic->inputPanel().clientPreedit().empty() &&
+                                        ic->inputPanel().preedit().empty() &&
+                                        state()->pinyin.empty() &&
+                                        state()->context.empty() &&
+                                        state()->candidates.empty() &&
+                                        state()->requestSeq == 0 &&
+                                        !state()->debounce &&
+                                        state()->generation > oldGeneration &&
+                                        !hasCandidate(ic, expectedWord),
+                                    "payload commit did not reset native/LLM "
+                                    "composition or left stale candidate");
+                                if (scenario == "mixed-contiguous-surrounding-inflight") {
+                                    // This probe used immediate dispatch. Restore
+                                    // debounce before its unrelated post-commit
+                                    // keys so they cannot race the final count.
+                                    RawConfig restore;
+                                    restore.setValueByPath("DebounceMs", "250");
+                                    llm->setConfig(restore);
+                                }
+                                type("shui");
+                                require(preeditText(ic) == "shui" &&
+                                            !hasCandidate(ic, expectedWord),
+                                        "payload commit retained old native "
+                                        "composition/badge");
+                                ic->reset();
+                                finish(true, "");
+                            }
+                        } else if (scenario == "stats-focus") {
                             if (stage == 0 &&
                                 dormantActionUpdates > dormantActionBefore) {
                                 checkStatistics(1, 0, 0);

@@ -8,6 +8,7 @@
 
 #include "llmbackend.h"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <curl/curl.h>
@@ -29,9 +30,21 @@ struct FetchResult {
     /// value still carries the sequence number so a superseded request can be
     /// discarded without being counted as an error.
     bool ok = false;
+    /// An actual curl attempt, not merely a submitted/processed job.
+    bool started = false;
+    /// Superseded, invalidated or stopped; observation is still permitted.
+    bool cancelled = false;
+    /// Logical transfer start through parsing/sanitizing completion, in ms.
+    uint64_t elapsedMs = 0;
+    /// Captured even for HTTP/transport errors; 0 means no HTTP response.
+    long httpStatus = 0;
     std::string pinyin;
     std::string error;
+    /// Raw extracted message.content, not the request or response envelope.
+    std::string content;
     std::vector<std::string> candidates;
+    /// Sanitizer diagnostics, or incomplete_response for a non-stop finish.
+    std::vector<RejectedCandidate> rejected;
 };
 
 using FetchCallback = std::function<void(FetchResult)>;
@@ -59,10 +72,15 @@ public:
     /// sequence is older than the newest one is dropped by the caller.
     /// started runs on the worker thread when a logical transfer is attempted,
     /// even if its reply is later cancelled or superseded. Marshal UI work to
-    /// the main thread; neither callback may throw.
+    /// the main thread; callbacks may not throw.
+    /// observed receives a copy for every processed job, including cancelled or
+    /// superseded jobs, before the current-only callback. It can run during
+    /// stop(); callers must protect owner lifetime when scheduling UI work.
+    /// Queued jobs replaced before run() takes them are not observed.
     uint64_t submit(BackendConfig config, std::string pinyin,
                     std::string context, FetchCallback callback,
-                    std::function<void()> started = {});
+                    std::function<void()> started = {},
+                    FetchCallback observed = {});
 
     /// Logical network attempts, not queued jobs or redirect hops. Includes
     /// failed/cancelled transfers; starting curl does not prove server receipt.
@@ -86,11 +104,13 @@ private:
         std::string context;
         FetchCallback callback;
         std::function<void()> started;
+        FetchCallback observed;
     };
 
     void run();
     /// Perform one request. Returns false on a transport or HTTP failure.
-    bool perform(const Job &job, std::string &body, std::string &error);
+    bool perform(const Job &job, std::string &body, FetchResult &result,
+                 std::optional<std::chrono::steady_clock::time_point> &startedAt);
     bool isCurrent(uint64_t seq) const;
 
     static size_t writeCallback(char *ptr, size_t size, size_t nmemb,

@@ -28,6 +28,23 @@ REPLIES = {
     "ceshi": ["测试"],
     "shui": ["谁"],
 }
+# Keep semantic candidate bytes independent of how the native engine segments
+# a foreign word such as "push" in its raw pinyin preedit.
+PAYLOAD_REPLIES = {
+    "mixed": "帮我push一下",
+    "mixed-contiguous-commit": "帮我commit一下",
+    "english": "Hello, world! C++ C#",
+    "digits": "2026",
+    "emoji": "😀 ☀\ufe0f ☁\ufe0e 👍🏽 👩\u200d💻 👨\u200d👩\u200d👧\u200d👦 🇨🇳 1\ufe0f\u20e3 #\ufe0f\u20e3 *\u20e3",
+    "emoji-tag": "\U0001f3f4\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f",
+}
+REPLIES.update({
+    "bang'wo'push'yi'xia": [PAYLOAD_REPLIES["mixed"]],
+    "ying'wen": [PAYLOAD_REPLIES["english"]],
+    "shu'zi": [PAYLOAD_REPLIES["digits"]],
+    "biao'qing": [PAYLOAD_REPLIES["emoji"]],
+    "qi'zi": [PAYLOAD_REPLIES["emoji-tag"]],
+})
 PINYIN_RE = re.compile(r"^[a-zA-Z']+$")
 
 
@@ -129,16 +146,41 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/invalid/"):
             self.respond(200, b"not JSON")
             return
+        if path.startswith("/invalid-utf8/"):
+            # A surrogate encoded as UTF-8 is not a Unicode scalar, even inside
+            # an otherwise valid completion envelope.
+            self.respond(200, b'{"choices":[{"message":{"content":"hello\xed\xa0\x80world"},"finish_reason":"stop"}]}')
+            return
         content = self.server.reply
         if content is None:
             content = "\n".join(make_reply(record["pinyin"], record["user"]))
         finish_reason = "stop"
-        if path.startswith("/empty/"):
+        payload_kind = path.split("/", 2)[1]
+        if payload_kind in PAYLOAD_REPLIES:
+            content = PAYLOAD_REPLIES[payload_kind]
+        elif path.startswith("/empty/"):
             content = ""
         elif path.startswith("/all-filtered/"):
-            # Valid completion envelope, but no candidate survives sanitizing:
-            # Latin output, incorrect Han length and punctuation-only content.
-            content = "not a Chinese candidate\n测试\n。。。"
+            # Valid envelope, but only key echo, incorrect Han length, controls,
+            # bidi formatting and punctuation. English is no longer rejected
+            # merely for being English. Tests use a six-syllable input here.
+            content = (record["pinyin"].upper().replace("'", " ") +
+                       "\n测试\nhello\tworld\n你好\u202e\n。。。")
+        elif path.startswith("/unsafe/"):
+            # Unsafe lines must not be repaired by edge trimming; a later safe
+            # English candidate must still survive the worker pipeline.
+            content = (record["pinyin"].upper().replace("'", " ") +
+                       "\n\thello!\nhello!\t\nhello\rworld\n你好\u0085" +
+                       "\n你好\u202e\nhello\u200dworld\n\ufe0f\n🏽" +
+                       "\n\U000e0067\nHello, world!")
+        elif path.startswith("/crlf/"):
+            content = "帮我push一下\r\nHello, world!\r\n👍🏽\r\n"
+        elif path.startswith("/history-rich/"):
+            # Accepted candidate text is untrusted HTML; history must render it
+            # as text, alongside the raw completion and rejected-line reasons.
+            content = ("她们正在开会\n他们正在开会。\n"
+                       "<script>history-html-marker</script>\nhello\tworld\n" +
+                       record["pinyin"].upper().replace("'", " "))
         elif path.startswith("/late-overlap/"):
             # With MaxCandidates=1 only the first novel reading is displayed.
             # The later native reading must still make this request overlap;
