@@ -149,6 +149,14 @@ FCITX_CONFIGURATION(
                            "{context} is replaced with the recently committed "
                            "text, {pinyin} with the keys being typed.")}};);
 
+/// The composition a request, a reply or a displayed candidate belongs to. One
+/// value answers "is this still what the user is typing?" everywhere.
+struct InputSnapshot {
+    uint64_t generation = 0;
+    std::string pinyin;
+    std::string context;
+};
+
 /// Per input context state. The candidate list is rebuilt from scratch on
 /// every keystroke, so everything that must survive a rebuild lives here.
 struct LlmState : public fcitx::InputContextProperty {
@@ -243,6 +251,11 @@ private:
                          std::string_view reason = "composition_invalidated");
     void invalidateAll();
     void removeCandidates(fcitx::InputContext *ic, LlmState *state);
+    /// Whether snapshot still describes the focused, eligible composition.
+    bool matchesInput(fcitx::InputContext *ic, const InputSnapshot &snapshot);
+    void handleFetch(fcitx::InputContext *ic, const InputSnapshot &snapshot,
+                     uint64_t historyId, FetchStage stage,
+                     const FetchResult &result);
     std::string currentPinyin(fcitx::InputContext *ic) const;
     static std::string cacheKey(const std::string &pinyin,
                                 const std::string &context);
@@ -266,7 +279,10 @@ private:
     void toggle();
     void refreshStatus();
     void refreshStatistics();
+    /// Update the menu entry now and coalesce snapshot rewrites.
     void refreshHistory();
+    bool writeHistorySnapshot();
+    void scheduleHistorySnapshot();
     static bool overlapsNative(fcitx::InputContext *ic,
                                const std::vector<std::string> &candidates);
     void compareNativeCandidates(fcitx::InputContext *ic,
@@ -304,6 +320,9 @@ private:
     fcitx::ScopedConnection clearHistoryConnection_;
     RequestHistory history_;
     HistorySnapshot historySnapshot_;
+    /// Pending coalesced rewrite of an already opened snapshot.
+    std::unique_ptr<fcitx::EventSourceTime> historySnapshotTimer_;
+    bool historySnapshotDirty_ = false;
     uint64_t comparedRequests_ = 0;
     uint64_t overlappingRequests_ = 0;
     std::vector<std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>>

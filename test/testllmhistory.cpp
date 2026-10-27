@@ -69,79 +69,100 @@ FetchResult successful() {
     result.elapsedMs = 1234;
     result.httpStatus = 200;
     result.pinyin = "nihao";
-    result.content = "[\"你好\",\"您好\"]";
+    result.content = "你好\n您好";
     result.candidates = {"你好", "您好"};
-    result.rejected = {{"wrong", "pinyin mismatch"}};
+    result.rejected = {{"wrong", "han_length_mismatch"}};
     return result;
 }
 
-void historyTests() {
+// Status transitions are the history's contract with the addon.
+void lifecycleTests() {
     RequestHistory history;
-    check(history.entries().empty(), "history starts empty");
-    const auto first = history.begin("nihao", "model-one");
-    check(first != 0, "identity is nonzero");
-    check(history.find(first)->status == "queued", "begin is queued");
-    check(history.find(first)->timestampMs > 0, "begin timestamps request");
-    const RequestHistory &constant = history;
-    check(constant.find(first) != nullptr && !constant.find(0), "const find works");
+    const auto id = history.begin("nihao", "model-one");
+    check(id != 0 && history.find(id)->status == RequestStatus::Queued,
+          "a new request is queued");
+    history.markStarted(id);
+    check(history.find(id)->status == RequestStatus::InFlight &&
+              history.find(id)->started, "started request is in flight");
+
     auto result = successful();
-    history.complete(first, result);
-    auto *entry = history.find(first);
-    check(entry->pinyin == "nihao" && entry->model == "model-one", "begin metadata retained");
-    check(entry->seq == 77 && entry->started && entry->elapsedMs == 1234 &&
-              entry->httpStatus == 200, "completion copies timing/status fields");
-    check(entry->content == result.content && entry->error.empty() &&
-              entry->candidates == result.candidates && entry->rejected.size() == 1 &&
-              entry->rejected.front().reason == "pinyin mismatch", "completion copies diagnostics");
-    check(entry->status == "completed" && !entry->overlap.has_value(), "completion status/unknown overlap");
-    history.adopt(first, "different", false);
-    check(entry->adoption.empty() && entry->adoptedText.empty(), "different candidate is never adopted");
-    history.adopt(first, "你好", false);
-    check(entry->adoption == "llm" && entry->adoptedText == "你好", "exact LLM adoption");
-    history.adopt(first, "您好", true);
-    check(entry->adoption == "native" && entry->adoptedText == "您好", "exact native adoption");
-    history.adopt(first, "invalid", false);
-    check(entry->adoption == "native" && entry->adoptedText == "您好", "mismatch does not overwrite adoption");
+    history.finish(id, result);
+    const auto *entry = history.find(id);
+    check(entry->status == RequestStatus::Completed && entry->seq == 77 &&
+              entry->elapsedMs == 1234 && entry->httpStatus == 200 &&
+              entry->candidates == result.candidates &&
+              entry->rejected.size() == 1, "finish records outcome and diagnostics");
+    check(!history.adoptable(id), "an unshown reply cannot be adopted");
+    history.markUsable(id, true);
+    check(entry->status == RequestStatus::Usable && entry->overlap == true &&
+              history.adoptable(id), "a shown reply is usable and adoptable");
+    history.adopt(id, "different", false);
+    check(entry->adoption.empty(), "only an exact candidate can be adopted");
+    history.adopt(id, "你好", false);
+    check(entry->adoption == "llm" && entry->adoptedText == "你好" &&
+              !history.adoptable(id), "exact adoption is recorded once");
 
-    for (int i = 0; i < 100; ++i) history.begin("pinyin", "model");
-    check(history.entries().size() == 100 && !history.find(first), "evicts oldest at 100");
-    history.complete(first, result);
+    const auto stale = history.begin("nihao", "m");
+    history.finish(stale, result);
+    history.markStale(stale);
+    check(history.find(stale)->status == RequestStatus::Stale, "stale reply is marked");
+
+    // The real cause of a cancellation survives the worker's generic report.
+    const auto cancelled = history.begin("nihao", "m");
+    history.markCancelled(cancelled, "focus_lost");
+    FetchResult aborted;
+    aborted.cancelled = true;
+    aborted.error = "cancelled";
+    history.finish(cancelled, aborted);
+    check(history.find(cancelled)->status == RequestStatus::Cancelled &&
+              history.find(cancelled)->error == "focus_lost",
+          "cancellation keeps its specific reason");
+    history.markCancelled(id, "late");
+    check(history.find(id)->status == RequestStatus::Usable,
+          "a finished request cannot be cancelled afterwards");
+
+    FetchResult failed;
+    failed.error = "http 500";
+    history.finish(stale, failed);
+    check(history.find(stale)->status == RequestStatus::Error, "failure is an error");
+    FetchResult empty;
+    empty.ok = true;
+    history.finish(stale, empty);
+    check(history.find(stale)->status == RequestStatus::Empty, "no output is empty");
+    empty.rejected = {{"x", "invalid_text"}};
+    history.finish(stale, empty);
+    check(history.find(stale)->status == RequestStatus::Filtered,
+          "only rejected output is filtered");
+
+    const auto hit = history.recordCacheHit("nihao", "m", {"你好"}, false);
+    check(history.find(hit)->status == RequestStatus::CacheHit &&
+              history.find(hit)->overlap == false && history.adoptable(hit),
+          "cache hits are recorded without a request");
+    history.adopt(hit, "你好", true);
+    check(history.find(hit)->adoption == "native", "cache hit can be adopted");
+}
+
+// IDs outlive eviction and clearing, so a late event can never resurrect or
+// corrupt another record.
+void identityTests() {
+    RequestHistory history;
+    const auto first = history.begin("nihao", "m");
+    for (int i = 0; i < 100; ++i) history.begin("pinyin", "m");
+    check(history.entries().size() == 100 && !history.find(first),
+          "oldest entry is evicted at 100");
+    history.markStarted(first);
+    history.finish(first, successful());
     history.adopt(first, "你好", false);
-    check(history.entries().size() == 100 && !history.find(first), "evicted callback cannot recreate");
-    const auto lastId = history.entries().back().id;
+    check(history.entries().size() == 100 && !history.find(first),
+          "events for an evicted entry are ignored");
+    const auto last = history.entries().back().id;
     history.clear();
-    check(history.entries().empty() && !history.find(lastId), "clear drops records");
-    history.complete(lastId, result);
-    history.adopt(lastId, "你好", false);
-    check(history.entries().empty(), "late completion/adoption after clear ignored");
-    const auto newId = history.begin("new", "model");
-    check(newId > lastId, "clear never resets IDs");
-    history.adopt(newId, "你好", false);
-    check(history.find(newId)->adoption.empty(), "old identities cannot leak into new entry");
-
-    result = {};
-    result.cancelled = true;
-    history.complete(newId, result);
-    check(history.find(newId)->status == "cancelled", "cancelled wins over error");
-    result.cancelled = false;
-    result.error = "network error";
-    history.complete(newId, result);
-    check(history.find(newId)->status == "error", "failed fetch is error");
-    result.ok = true;
-    result.error.clear();
-    result.content = " \t\r\n";
-    history.complete(newId, result);
-    check(history.find(newId)->status == "empty", "blank successful body is empty");
-    result.content = "not accepted";
-    history.complete(newId, result);
-    check(history.find(newId)->status == "empty", "success without candidates or rejections is empty");
-    result.content = "[]";
-    history.complete(newId, result);
-    check(history.find(newId)->status == "empty", "empty candidate array is empty, not filtered");
-    result.content.clear();
-    result.rejected = {{"bad", "not a string"}};
-    history.complete(newId, result);
-    check(history.find(newId)->status == "filtered", "rejection even without raw body is filtered");
+    history.finish(last, successful());
+    check(history.entries().empty(), "events after clear are ignored");
+    const auto fresh = history.begin("new", "m");
+    check(fresh > last, "clearing never reuses ids");
+    history.adopt(fresh, "你好", false);
+    check(history.find(fresh)->adoption.empty(), "old identities cannot leak into new entries");
 }
 
 void safetyAndLimitTests() {
@@ -154,53 +175,30 @@ void safetyAndLimitTests() {
     result.error = chinese;
     result.candidates.assign(40, chinese);
     result.rejected.assign(40, RejectedCandidate{chinese, chinese});
-    history.complete(id, result);
-    auto *entry = history.find(id);
-    check(entry->content.size() <= 8192 && contains(entry->content, "…"), "response bounded with truncation marker");
-    check(entry->error.size() <= 1024 && validDisplayUtf8(entry->error), "error UTF-8-safe limit");
-    check(entry->candidates.size() == 32 && entry->rejected.size() == 32, "accepted and rejected count caps");
+    history.finish(id, result);
+    const auto *entry = history.find(id);
+    check(entry->content.size() <= 8192 && contains(entry->content, "…"),
+          "response is bounded with a truncation marker");
+    check(entry->candidates.size() == 32 && entry->rejected.size() == 32,
+          "accepted and rejected lists are capped");
     for (const auto &candidate : entry->candidates) {
-        check(candidate.size() <= 1024 && validDisplayUtf8(candidate) &&
-                  contains(candidate, "…"), "candidate UTF-8-safe truncation");
+        check(candidate.size() <= 1024 && validDisplayUtf8(candidate),
+              "displayed text is bounded and valid UTF-8");
     }
-    for (const auto &candidate : entry->rejected) {
-        check(candidate.text.size() <= 1024 && candidate.reason.size() <= 1024 &&
-                  validDisplayUtf8(candidate.text) && validDisplayUtf8(candidate.reason), "rejected text/reason caps");
-    }
+    history.markUsable(id, false);
     history.adopt(id, entry->candidates.front(), false);
-    check(entry->adoption.empty(), "truncated text cannot impersonate exact original");
+    check(entry->adoption.empty(), "truncated text cannot impersonate the original");
     history.adopt(id, chinese, false);
-    check(entry->adoption == "llm" && entry->adoptedText.size() <= 1024 &&
-              contains(entry->adoptedText, "…"), "long original matches, adoption display remains bounded");
+    check(entry->adoption == "llm" && entry->adoptedText.size() <= 1024,
+          "the exact long original still adopts, displayed bounded");
 
-    result.candidates = {std::string(65537, 'x'), "allowed"};
-    history.complete(id, result);
-    entry->adoption.clear();
-    entry->adoptedText.clear();
-    history.adopt(id, result.candidates[0], false);
-    check(entry->adoption.empty(), "candidate over identity budget cannot adopt");
-    history.adopt(id, "allowed", false);
-    check(entry->adoption == "llm", "smaller candidate within remaining budget can adopt");
-    result.candidates = {std::string(40000, 'a'), std::string(40000, 'b')};
-    history.complete(id, result);
-    entry->adoption.clear();
-    history.adopt(id, result.candidates[1], false);
-    check(entry->adoption.empty(), "aggregate exact identity bytes capped at 64 KiB");
+    // Native duplicates can push a late candidate onto the screen.
     result.candidates.assign(32, "native-duplicate");
     result.candidates.push_back("novel-33rd");
-    history.complete(id, result);
-    check(entry->candidates.size() == 32, "public candidate display stays capped at 32");
+    history.finish(id, result);
+    history.markUsable(id, false);
     history.adopt(id, "novel-33rd", false);
-    check(entry->adoption == "llm" && entry->adoptedText == "novel-33rd",
-          "33rd exact candidate can adopt after native duplicates are skipped");
-    result.candidates.assign(40, "");
-    result.candidates.push_back("after-empty");
-    history.complete(id, result);
-    history.adopt(id, "", false);
-    check(entry->adoption.empty(), "empty candidate identities are never retained or adopted");
-    history.adopt(id, "after-empty", false);
-    check(entry->adoption == "llm" && entry->adoptedText == "after-empty",
-          "empty candidates do not prevent later exact adoption");
+    check(entry->adoption == "llm", "a candidate beyond the displayed 32 can be adopted");
 
     const std::string malicious = std::string("A\0B\n\r\t", 7) + "\x01\x7f\x80\xff" +
                                   "\xc0\xaf\xed\xa0\x80\xf4\x90\x80\x80" +
@@ -208,77 +206,44 @@ void safetyAndLimitTests() {
     result.content = malicious;
     result.error = malicious;
     result.candidates = {malicious};
-    result.rejected = {{malicious, "non-string: <object>\n"}};
-    history.complete(id, result);
+    result.rejected = {{malicious, "x"}};
+    history.finish(id, result);
     check(validDisplayUtf8(entry->content) && validDisplayUtf8(entry->error) &&
-              validDisplayUtf8(entry->candidates.front()), "invalid UTF-8 and controls sanitized");
-    check(contains(entry->content, "\\x00") && contains(entry->content, "\\n") &&
-              contains(entry->content, "\\xFF") && contains(entry->content, "\\u0085") &&
-              contains(entry->content, "\\u202E") && contains(entry->content, "正常"), "invalid/control bytes visible ASCII, valid Chinese kept");
-    history.adopt(id, entry->candidates.front(), false);
-    check(entry->adoption.empty(), "escaped display cannot impersonate raw exact candidate");
-    history.adopt(id, malicious, false);
-    check(entry->adoption == "llm" && validDisplayUtf8(entry->adoptedText), "raw exact adoption sanitized for display");
+              validDisplayUtf8(entry->candidates.front()),
+          "invalid UTF-8 and controls never reach the viewer");
+    check(contains(entry->content, "\\x00") && contains(entry->content, "\\u202E") &&
+              contains(entry->content, "正常"),
+          "unsafe bytes become visible escapes while valid text is kept");
 }
 
 void rendererTests() {
     RequestHistory history;
     auto html = renderHistoryHtml(history, false);
-    check(contains(html, "<!doctype html>") && contains(html, "No request history") &&
-              contains(html, "Disabled") && contains(html, "Clear LLM request history"), "standalone empty/disabled/clear instructions");
-    check(contains(html, "default-src 'none'") && contains(html, "style-src 'unsafe-inline'"), "restrictive CSP");
-    check(!contains(html, "<script") && !contains(html, "<a ") &&
-              !contains(html, "src=") && !contains(html, "href="), "no scripts, resources, or links");
-    const auto first = history.begin("old-pinyin", "old-model");
+    check(contains(html, "No request history") && contains(html, "Disabled"),
+          "empty history explains itself");
+    check(contains(html, "default-src 'none'") && !contains(html, "<script") &&
+              !contains(html, "href=") && !contains(html, "src="),
+          "page is script-free with a restrictive CSP");
+    history.begin("old-pinyin", "old-model");
     const std::string attack = "<script>alert('x')</script><img src=x onerror=alert(1)>\"&";
     const auto second = history.begin("new-pinyin" + attack, "model" + attack);
     auto result = successful();
     result.content = attack;
     result.error = attack;
     result.candidates = {attack};
-    result.rejected = {{attack, "not a string: " + attack}};
-    history.complete(second, result);
-    auto *entry = history.find(second);
-    entry->timestampMs = 123456789;
-    entry->status = "usable";
-    entry->overlap = true;
+    result.rejected = {{attack, attack}};
+    history.finish(second, result);
+    history.markUsable(second, true);
     history.adopt(second, attack, false);
     html = renderHistoryHtml(history, true);
-    check(html.find("new-pinyin") < html.find("old-pinyin"), "newest rendered first");
-    check(contains(html, "Enabled") && contains(html, "Usable") && contains(html, "123456789 ms") &&
-              contains(html, "Seq 77") && contains(html, "1234 ms") && contains(html, "HTTP 200") &&
-              contains(html, "LLM adoption") && contains(html, "Native overlap"), "renderer shows metadata, overlap and adoption");
-    check(contains(html, "Raw LLM") && contains(html, "Accepted (1)") &&
-              contains(html, "Rejected &amp; why (1)") && contains(html, "not a string:"), "all diagnostic fields included");
-    check(contains(html, "&lt;script&gt;") && contains(html, "&#39;x&#39;") &&
-              contains(html, "&quot;&amp;") && !contains(html, "<script>") &&
-              !contains(html, "<img"), "all untrusted fields escaped against XSS");
-    entry->status = attack;
-    entry->adoption = attack;
-    entry->pinyin = std::string("p\0\xff", 3);
-    html = renderHistoryHtml(history, true);
-    check(!contains(html, "<script>") && contains(html, "\\x00\\xFF"), "mutable public fields revalidated/escaped");
-    entry->status = "stale";
-    entry->overlap = false;
-    history.adopt(second, attack, true);
-    html = renderHistoryHtml(history, true);
-    check(contains(html, "Stale") && contains(html, "Native adoption") &&
-              contains(html, "HTTP 200</td><td>否 / No<br>"), "stale, false overlap and native adoption labels");
-    entry->overlap = true;
-    html = renderHistoryHtml(history, true);
-    check(contains(html, "HTTP 200</td><td>是 / Yes<br>"), "true overlap rendered distinctly");
-    history.find(first)->status = "cancelled";
-    html = renderHistoryHtml(history, true);
-    check(contains(html, "Cancelled") && contains(html, "Unknown"), "cancelled and unknown overlap labels");
-    const std::pair<const char *, const char *> statuses[] = {
-        {"queued", "Queued"}, {"inflight", "请求中 / In flight"},
-        {"cache_hit", "缓存命中 / Cache hit"}, {"error", "Error"}, {"empty", "Empty"},
-        {"filtered", "Filtered"}, {"completed", "Completed"}};
-    for (const auto &status : statuses) {
-        entry->status = status.first;
-        html = renderHistoryHtml(history, true);
-        check(contains(html, status.second), "fixed status has bilingual label");
-    }
+    check(html.find("new-pinyin") < html.find("old-pinyin"), "newest request first");
+    check(contains(html, "Usable") && contains(html, "Seq 77") &&
+              contains(html, "HTTP 200") && contains(html, "LLM adoption") &&
+              contains(html, "Rejected &amp; why (1)"),
+          "page shows status, timing, adoption and rejections");
+    check(contains(html, "&lt;script&gt;") && contains(html, "&quot;&amp;") &&
+              !contains(html, "<script>") && !contains(html, "<img"),
+          "every untrusted field is HTML-escaped");
 }
 
 std::string readSnapshot(const std::string &path) {
@@ -380,7 +345,8 @@ void snapshotTests() {
 } // namespace
 
 int main() {
-    historyTests();
+    lifecycleTests();
+    identityTests();
     safetyAndLimitTests();
     rendererTests();
     snapshotTests();

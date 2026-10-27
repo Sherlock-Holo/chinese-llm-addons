@@ -24,6 +24,7 @@
 #include <fcitx/userinterfacemanager.h>
 #include <format>
 #include <functional>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -43,6 +44,8 @@ constexpr char kEnvApiKey[] = "FCITX_CHINESE_LLM_API_KEY";
 /// monochrome cloud (U+2601 U+FE0E), not a colored emoji, in its display
 /// comment.
 constexpr char kBadge[] = "\u2601\uFE0E";
+/// Quiet period before an opened history snapshot is rewritten.
+constexpr uint64_t kSnapshotDelayUs = 300 * 1000;
 
 /**
  * A candidate backed by model output.
@@ -260,9 +263,7 @@ ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
             auto *state = ic->propertyFor(&factory_);
             const auto id =
                 state->historyId ? state->historyId : state->commitHistoryId;
-            if (const auto *entry = history_.find(id);
-                entry && entry->adoption.empty() &&
-                (entry->status == "usable" || entry->status == "cache_hit")) {
+            if (history_.adoptable(id)) {
                 history_.adopt(id, commit.text(), true);
                 refreshHistory();
             }
@@ -548,10 +549,8 @@ void ChineseLlm::invalidateState(fcitx::InputContext *ic, LlmState *state,
     } else if (!preserveCommit) {
         state->commitHistoryId = 0;
     }
-    if (auto *entry = history_.find(state->historyId);
-        entry && (entry->status == "queued" || entry->status == "inflight")) {
-        entry->status = "cancelled";
-        entry->error = std::string(reason);
+    if (state->historyId) {
+        history_.markCancelled(state->historyId, std::string(reason));
         refreshHistory();
     }
     state->historyId = 0;
@@ -625,16 +624,9 @@ void ChineseLlm::handleUpdateUI(fcitx::Event &event) {
         cacheOrder_.push_back(key);
         state->candidates = iter->second;
         if (config_.recordHistory.value()) {
-            state->historyId = history_.begin(pinyin, config_.model.value());
-            FetchResult cached;
-            cached.ok = true;
-            cached.pinyin = pinyin;
-            cached.candidates = state->candidates;
-            history_.complete(state->historyId, cached);
-            if (auto *entry = history_.find(state->historyId)) {
-                entry->status = "cache_hit";
-                entry->overlap = overlapsNative(ic, cached.candidates);
-            }
+            state->historyId = history_.recordCacheHit(
+                pinyin, config_.model.value(), state->candidates,
+                overlapsNative(ic, state->candidates));
             refreshHistory();
         }
         insertCandidates(ic, state, state->candidates);
@@ -658,7 +650,10 @@ void ChineseLlm::scheduleRequest(fcitx::InputContext *ic, LlmState *state,
     state->debounce = instance_->eventLoop().addTimeEvent(
         CLOCK_MONOTONIC,
         fcitx::now(CLOCK_MONOTONIC) + static_cast<uint64_t>(debounce) * 1000,
-        static_cast<uint64_t>(debounce) * 1000,
+        // Accuracy is how late the timer may fire, not its interval. The
+        // event loop's default (and the debounce value itself) lets it slip
+        // by up to that much again, doubling the configured delay.
+        1000,
         [this, owner = watch(), ref = ic->watch(),
          generation = state->generation, pinyin = std::move(pinyin),
          context = std::move(context)](fcitx::EventSourceTime *,
@@ -675,128 +670,104 @@ void ChineseLlm::scheduleRequest(fcitx::InputContext *ic, LlmState *state,
     state->debounce->setOneShot();
 }
 
+bool ChineseLlm::matchesInput(fcitx::InputContext *ic,
+                              const InputSnapshot &snapshot) {
+    return isEligible(ic) &&
+           ic->propertyFor(&factory_)->generation == snapshot.generation &&
+           currentPinyin(ic) == snapshot.pinyin &&
+           buildContext(ic) == snapshot.context;
+}
+
 void ChineseLlm::dispatchRequest(fcitx::InputContext *ic, LlmState *state,
                                  std::string pinyin, std::string context,
                                  uint64_t generation) {
-    if (state->generation != generation || !isEligible(ic) ||
-        currentPinyin(ic) != pinyin || buildContext(ic) != context) {
+    InputSnapshot snapshot{generation, std::move(pinyin), std::move(context)};
+    if (state->generation != generation || !matchesInput(ic, snapshot)) {
         return;
     }
     // Create references on the main thread and only dereference them there.
     // The dispatcher outlives the addon; queued callbacks also track the addon,
     // not only the client, so unloading cannot leave a raw-this callback
     // behind.
-    auto ref = ic->watch();
-    const auto historyId = config_.recordHistory.value()
-                               ? history_.begin(pinyin, config_.model.value())
-                               : 0;
+    const auto historyId =
+        config_.recordHistory.value()
+            ? history_.begin(snapshot.pinyin, config_.model.value())
+            : 0;
     state->historyId = historyId;
     state->requestSeq = worker_->submit(
-        backendConfig(), std::move(pinyin), context,
-        [dispatcher = &dispatcher_, owner = watch(), ref, context, generation,
-         historyId](FetchResult result) {
-            dispatcher->schedule([owner, ref, context, generation, historyId,
-                                  result = std::move(result)]() {
-                auto *self = owner.get();
-                auto *ic = ref.get();
-                if (!self || !ic) {
-                    return;
-                }
-                auto *state = ic->propertyFor(&self->factory_);
-                if (result.seq != self->worker_->currentSeq() ||
-                    state->generation != generation || !self->isEligible(ic) ||
-                    self->currentPinyin(ic) != result.pinyin ||
-                    self->buildContext(ic) != context) {
-                    if (auto *entry = self->history_.find(historyId);
-                        entry && result.ok && !result.cancelled) {
-                        entry->status = "stale";
-                        entry->error =
-                            "Reply no longer matches the current input";
-                        self->refreshHistory();
+        backendConfig(), snapshot.pinyin, snapshot.context,
+        [dispatcher = &dispatcher_, owner = watch(), ref = ic->watch(),
+         snapshot, historyId](FetchStage stage, const FetchResult &result) {
+            // Any thread. Every event, including cancellations, reaches the
+            // main thread, where one place decides what it still means.
+            dispatcher->schedule(
+                [owner, ref, snapshot, historyId, stage, result]() {
+                    if (auto *self = owner.get()) {
+                        self->handleFetch(ref.get(), snapshot, historyId, stage,
+                                          result);
                     }
-                    return;
-                }
-                state->requestSeq = 0;
-                if (!result.ok) {
-                    self->noteError(result.error);
-                    return;
-                }
-                self->errorCount_ = 0;
-                state->candidates = result.candidates;
-                if (result.candidates.empty()) {
-                    return;
-                }
-                // Only fresh, usable network results enter the denominator.
-                // Account before insertion, so neither our own candidates nor
-                // later cache/UI replays can be mistaken for native matches.
-                if (auto *entry = self->history_.find(historyId)) {
-                    entry->status = "usable";
-                    entry->overlap = overlapsNative(ic, result.candidates);
-                    self->refreshHistory();
-                }
-                self->compareNativeCandidates(ic, result.candidates);
-                self->rememberCandidates(cacheKey(result.pinyin, context),
-                                         result.candidates);
-                self->insertCandidates(ic, state, state->candidates);
-            });
-        },
-        [dispatcher = &dispatcher_, owner = watch(), historyId] {
-            // Start notifications survive invalidation, but never recreate a
-            // history row that the user cleared or privacy handling removed.
-            dispatcher->schedule([owner, historyId] {
-                if (auto *self = owner.get()) {
-                    if (auto *entry = self->history_.find(historyId)) {
-                        entry->started = true;
-                        if (entry->status == "queued") {
-                            entry->status = "inflight";
-                        }
-                        self->refreshHistory();
-                    }
-                    self->refreshStatistics();
-                }
-            });
-        },
-        [dispatcher = &dispatcher_, owner = watch(), ref, context, generation,
-         historyId](FetchResult result) {
-            dispatcher->schedule([owner, ref, context, generation, historyId,
-                                  result = std::move(result)] {
-                auto *self = owner.get();
-                if (!self || !self->config_.recordHistory.value() ||
-                    !self->history_.find(historyId)) {
-                    return;
-                }
-                auto *ic = ref.get();
-                if (ic && ic->capabilityFlags().testAny(
-                              CapabilityFlag::PasswordOrSensitive)) {
-                    self->clearHistory();
-                    return;
-                }
-                const auto *previous = self->history_.find(historyId);
-                const auto cancellationReason =
-                    previous && previous->status == "cancelled"
-                        ? previous->error
-                        : std::string();
-                self->history_.complete(historyId, result);
-                auto *entry = self->history_.find(historyId);
-                if (entry && result.cancelled && !cancellationReason.empty()) {
-                    entry->error = cancellationReason;
-                }
-                auto *state = ic ? ic->propertyFor(&self->factory_) : nullptr;
-                if (entry && result.ok && !result.cancelled &&
-                    (!state || result.seq != self->worker_->currentSeq() ||
-                     state->generation != generation || !self->isEligible(ic) ||
-                     self->currentPinyin(ic) != result.pinyin ||
-                     self->buildContext(ic) != context)) {
-                    entry->status = "stale";
-                    entry->error = "Reply no longer matches the current input";
-                }
-                self->refreshHistory();
-            });
+                });
         });
-    if (auto *entry = history_.find(historyId)) {
-        entry->seq = state->requestSeq;
-    }
+    history_.setSeq(historyId, state->requestSeq);
     refreshHistory();
+}
+
+void ChineseLlm::handleFetch(fcitx::InputContext *ic,
+                             const InputSnapshot &snapshot, uint64_t historyId,
+                             FetchStage stage, const FetchResult &result) {
+    if (stage == FetchStage::Started) {
+        // Start notifications survive invalidation, but never recreate a
+        // history row that the user cleared or privacy handling removed.
+        history_.markStarted(historyId);
+        refreshHistory();
+        refreshStatistics();
+        return;
+    }
+
+    const bool current = ic && !result.cancelled &&
+                         result.seq == worker_->currentSeq() &&
+                         matchesInput(ic, snapshot);
+    std::optional<bool> overlap;
+    if (current && result.ok && !result.candidates.empty()) {
+        overlap = overlapsNative(ic, result.candidates);
+    }
+
+    if (config_.recordHistory.value() && history_.find(historyId)) {
+        if (ic && ic->capabilityFlags().testAny(
+                      CapabilityFlag::PasswordOrSensitive)) {
+            clearHistory();
+        } else {
+            history_.finish(historyId, result);
+            if (overlap) {
+                history_.markUsable(historyId, *overlap);
+            } else if (result.ok && !result.cancelled && !current) {
+                history_.markStale(historyId);
+            }
+            refreshHistory();
+        }
+    }
+    if (!current) {
+        return;
+    }
+
+    auto *state = ic->propertyFor(&factory_);
+    state->requestSeq = 0;
+    if (!result.ok) {
+        noteError(result.error);
+        return;
+    }
+    errorCount_ = 0;
+    state->candidates = result.candidates;
+    if (result.candidates.empty()) {
+        return;
+    }
+    // Only fresh, usable network results enter the denominator. Account before
+    // insertion, so neither our own candidates nor later cache/UI replays can
+    // be mistaken for native matches.
+    compareNativeCandidates(ic, result.candidates);
+    rememberCandidates(cacheKey(result.pinyin, snapshot.context),
+                       result.candidates);
+    insertCandidates(ic, state, state->candidates);
 }
 
 void ChineseLlm::rememberCandidates(
@@ -866,18 +837,15 @@ void ChineseLlm::insertCandidates(fcitx::InputContext *ic, LlmState *state,
     const int position =
         std::clamp(config_.candidateIndex.value() - 1, 0, total);
 
-    const auto valid = [owner = watch(), ref = ic->watch(),
-                        generation = state->generation, pinyin = state->pinyin,
-                        context = state->context](InputContext *selectedIc) {
-        auto *self = owner.get();
-        auto *ic = ref.get();
-        if (!self || !ic || selectedIc != ic || !self->isEligible(ic)) {
-            return false;
-        }
-        return ic->propertyFor(&self->factory_)->generation == generation &&
-               self->currentPinyin(ic) == pinyin &&
-               self->buildContext(ic) == context;
-    };
+    const auto valid =
+        [owner = watch(), ref = ic->watch(),
+         snapshot = InputSnapshot{state->generation, state->pinyin,
+                                  state->context}](InputContext *selectedIc) {
+            auto *self = owner.get();
+            auto *ic = ref.get();
+            return self && ic && selectedIc == ic &&
+                   self->matchesInput(ic, snapshot);
+        };
     state->inserting = true;
     // Insert back to front so the first candidate ends up first on screen.
     for (int i = static_cast<int>(toInsert.size()) - 1; i >= 0; i--) {
@@ -947,8 +915,7 @@ void ChineseLlm::refreshStatus() {
 }
 
 void ChineseLlm::openHistory(bool launchBrowser) {
-    if (!historySnapshot_.write(
-            renderHistoryHtml(history_, config_.recordHistory.value()))) {
+    if (!writeHistorySnapshot()) {
         FCITX_WARN()
             << "chinese-llm: unable to create private history snapshot";
         return;
@@ -960,6 +927,8 @@ void ChineseLlm::openHistory(bool launchBrowser) {
 }
 
 void ChineseLlm::clearHistory() {
+    historySnapshotDirty_ = false;
+    historySnapshotTimer_.reset();
     history_.clear();
     historySnapshot_.clear();
     instance_->inputContextManager().foreach([this](InputContext *ic) {
@@ -971,18 +940,40 @@ void ChineseLlm::clearHistory() {
     refreshHistory();
 }
 
+bool ChineseLlm::writeHistorySnapshot() {
+    historySnapshotDirty_ = false;
+    return historySnapshot_.write(
+        renderHistoryHtml(history_, config_.recordHistory.value()));
+}
+
+void ChineseLlm::scheduleHistorySnapshot() {
+    // Rendering up to 100 rows and rewriting the file on every request event
+    // would run on the input thread several times per keystroke. An opened
+    // snapshot only needs to be current by the time the user refreshes it, so
+    // changes within a short window share one trailing rewrite.
+    if (historySnapshotDirty_ || !historySnapshot_.exists()) {
+        return;
+    }
+    historySnapshotDirty_ = true;
+    historySnapshotTimer_ = instance_->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC, fcitx::now(CLOCK_MONOTONIC) + kSnapshotDelayUs,
+        10 * 1000, [this](fcitx::EventSourceTime *, uint64_t) {
+            if (historySnapshotDirty_ && !writeHistorySnapshot()) {
+                FCITX_WARN()
+                    << "chinese-llm: unable to update private history snapshot";
+            }
+            return true;
+        });
+    historySnapshotTimer_->setOneShot();
+}
+
 void ChineseLlm::refreshHistory() {
     const auto count = history_.entries().size();
     const auto text = std::vformat(D_("chinese-llm", "LLM request history {0}"),
                                    std::make_format_args(count));
     const bool changed = historyAction_.shortText(nullptr) != text;
     historyAction_.setShortText(text);
-    if (historySnapshot_.exists() &&
-        !historySnapshot_.write(
-            renderHistoryHtml(history_, config_.recordHistory.value()))) {
-        FCITX_WARN()
-            << "chinese-llm: unable to update private history snapshot";
-    }
+    scheduleHistorySnapshot();
     if (changed) {
         instance_->inputContextManager().foreach([this](InputContext *ic) {
             if (isLlmInputMethod(ic) &&

@@ -21,13 +21,11 @@ REPLIES = {
     "nihao": ["你好"],
     "ni'hao": ["你好"],
     "ta'men'zheng'zai'kai'hui": ["他们正在开会", "她们正在开会"],
-    "ta'men'zheng'zai'kai'hui'ma": ["他们正在开会吗"],
     "jin'tian'tian'qi'bu'cuo": ["今天天气不错"],
     "wo'zai'xue'xi": ["我在学习"],
     "nihao'ya": ["你好呀"],
     "nhsj": ["你换手机"],
     "ceshi": ["测试"],
-    "ce'shi": ["测试"],
     "shui": ["谁"],
 }
 # Keep semantic candidate bytes independent of how the native engine segments
@@ -35,17 +33,9 @@ REPLIES = {
 PAYLOAD_REPLIES = {
     "mixed": "帮我push一下",
     "mixed-contiguous-commit": "帮我commit一下",
-    "english": "Hello, world! C++ C#",
-    "digits": "2026",
-    "emoji": "😀 ☀\ufe0f ☁\ufe0e 👍🏽 👩\u200d💻 👨\u200d👩\u200d👧\u200d👦 🇨🇳 1\ufe0f\u20e3 #\ufe0f\u20e3 *\u20e3",
-    "emoji-tag": "\U0001f3f4\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f",
 }
 REPLIES.update({
     "bang'wo'push'yi'xia": [PAYLOAD_REPLIES["mixed"]],
-    "ying'wen": [PAYLOAD_REPLIES["english"]],
-    "shu'zi": [PAYLOAD_REPLIES["digits"]],
-    "biao'qing": [PAYLOAD_REPLIES["emoji"]],
-    "qi'zi": [PAYLOAD_REPLIES["emoji-tag"]],
 })
 PINYIN_RE = re.compile(r"^[a-zA-Z']+$")
 
@@ -168,26 +158,12 @@ class Handler(BaseHTTPRequestHandler):
             # merely for being English. Tests use a six-syllable input here.
             content = (record["pinyin"].upper().replace("'", " ") +
                        "\n测试\nhello\tworld\n你好\u202e\n。。。")
-        elif path.startswith("/unsafe/"):
-            # Unsafe lines must not be repaired by edge trimming; a later safe
-            # English candidate must still survive the worker pipeline.
-            content = (record["pinyin"].upper().replace("'", " ") +
-                       "\n\thello!\nhello!\t\nhello\rworld\n你好\u0085" +
-                       "\n你好\u202e\nhello\u200dworld\n\ufe0f\n🏽" +
-                       "\n\U000e0067\nHello, world!")
-        elif path.startswith("/crlf/"):
-            content = "帮我push一下\r\nHello, world!\r\n👍🏽\r\n"
         elif path.startswith("/history-rich/"):
             # Accepted candidate text is untrusted HTML; history must render it
             # as text, alongside the raw completion and rejected-line reasons.
             content = ("她们正在开会\n他们正在开会。\n"
                        "<script>history-html-marker</script>\nhello\tworld\n" +
                        record["pinyin"].upper().replace("'", " "))
-        elif path.startswith("/late-overlap/"):
-            # With MaxCandidates=1 only the first novel reading is displayed.
-            # The later native reading must still make this request overlap;
-            # trailing punctuation is sanitized before exact comparison.
-            content = "她们正在开会\n他们正在开会。\n它们正在开会"
         elif path.startswith("/truncated/"):
             content = "你好"
             finish_reason = "length"

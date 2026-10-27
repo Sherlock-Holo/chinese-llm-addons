@@ -73,7 +73,16 @@ std::string boundedDiagnosticContent(std::string_view content) {
 
 LlmWorker::LlmWorker() {
     curl_ = curl_easy_init();
-    if (!curl_) {
+    multi_ = curl_multi_init();
+    if (!curl_ || !multi_) {
+        if (curl_) {
+            curl_easy_cleanup(curl_);
+        }
+        if (multi_) {
+            curl_multi_cleanup(multi_);
+        }
+        curl_ = nullptr;
+        multi_ = nullptr;
         throw std::runtime_error("Failed to init CURL handle.");
     }
     // These are safe to set once and never change. The body pointer is set per
@@ -82,6 +91,12 @@ LlmWorker::LlmWorker() {
         (curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION,
                           &LlmWorker::writeCallback) == CURLE_OK) &&
         (curl_easy_setopt(curl_, CURLOPT_NOSIGNAL, 1L) == CURLE_OK) &&
+        // Only plain HTTP(S) is ever a legitimate completions endpoint, both
+        // for the configured URL and for any redirect it answers with.
+        (curl_easy_setopt(curl_, CURLOPT_PROTOCOLS_STR, "http,https") ==
+         CURLE_OK) &&
+        (curl_easy_setopt(curl_, CURLOPT_REDIR_PROTOCOLS_STR, "http,https") ==
+         CURLE_OK) &&
         // Follow a redirect so an endpoint behind a proxy works, but never
         // leak the Authorization header to another host.
         (curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L) == CURLE_OK) &&
@@ -91,13 +106,12 @@ LlmWorker::LlmWorker() {
         (curl_easy_setopt(curl_, CURLOPT_POSTREDIR,
                           static_cast<long>(CURL_REDIR_POST_ALL)) ==
          CURLE_OK) &&
-        (curl_easy_setopt(curl_, CURLOPT_UNRESTRICTED_AUTH, 0L) == CURLE_OK) &&
-        (curl_easy_setopt(curl_, CURLOPT_NOPROGRESS, 0L) == CURLE_OK) &&
-        (curl_easy_setopt(curl_, CURLOPT_XFERINFOFUNCTION,
-                          &LlmWorker::progressCallback) == CURLE_OK);
+        (curl_easy_setopt(curl_, CURLOPT_UNRESTRICTED_AUTH, 0L) == CURLE_OK);
     if (!ok) {
         curl_easy_cleanup(curl_);
+        curl_multi_cleanup(multi_);
         curl_ = nullptr;
+        multi_ = nullptr;
         throw std::runtime_error("Failed to setup CURL handle options.");
     }
 }
@@ -107,6 +121,10 @@ LlmWorker::~LlmWorker() {
     if (curl_) {
         curl_easy_cleanup(curl_);
         curl_ = nullptr;
+    }
+    if (multi_) {
+        curl_multi_cleanup(multi_);
+        multi_ = nullptr;
     }
 }
 
@@ -119,23 +137,46 @@ void LlmWorker::start() {
 }
 
 void LlmWorker::stop() {
+    std::optional<Job> dropped;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         stop_.store(true, std::memory_order_relaxed);
         seq_.fetch_add(1, std::memory_order_relaxed);
+        dropped = std::move(pending_);
         pending_.reset();
     }
+    wake();
     cv_.notify_all();
     if (thread_.joinable()) {
         thread_.join();
     }
+    if (dropped) {
+        reportDropped(*dropped);
+    }
+}
+
+void LlmWorker::reportDropped(Job &job) {
+    if (!job.handler) {
+        return;
+    }
+    FetchResult result;
+    result.seq = job.seq;
+    result.pinyin = job.pinyin;
+    result.cancelled = true;
+    result.error = "cancelled";
+    job.handler(FetchStage::Finished, result);
+}
+
+void LlmWorker::wake() {
+    if (multi_) {
+        curl_multi_wakeup(multi_);
+    }
 }
 
 uint64_t LlmWorker::submit(BackendConfig config, std::string pinyin,
-                           std::string context, FetchCallback callback,
-                           std::function<void()> started,
-                           FetchCallback observed) {
+                           std::string context, FetchHandler handler) {
     uint64_t seq;
+    std::optional<Job> replaced;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         // Assign the sequence under the same lock as pending_, so cancellation
@@ -145,24 +186,36 @@ uint64_t LlmWorker::submit(BackendConfig config, std::string pinyin,
         // Replacing rather than queuing is the whole point: only the newest
         // pinyin is worth asking about, and this is where the per-keystroke
         // fan-out is collapsed into a single request.
+        replaced = std::move(pending_);
         pending_.emplace(Job{.seq = seq,
                              .config = std::move(config),
                              .pinyin = std::move(pinyin),
                              .context = std::move(context),
-                             .callback = std::move(callback),
-                             .started = std::move(started),
-                             .observed = std::move(observed)});
+                             .handler = std::move(handler)});
     }
+    // The transfer in flight (if any) is now older than the newest request.
+    wake();
     cv_.notify_one();
+    if (replaced) {
+        reportDropped(*replaced);
+    }
     return seq;
 }
 
 void LlmWorker::cancelAll() {
-    // Bumping the sequence makes replies stale and the progress callback aborts
-    // an in-flight transfer, freeing the single worker for the next request.
-    const std::lock_guard<std::mutex> lock(mutex_);
-    seq_.fetch_add(1, std::memory_order_relaxed);
-    pending_.reset();
+    // Bumping the sequence makes replies stale; the wakeup lets an in-flight
+    // transfer notice immediately and frees the worker for the next request.
+    std::optional<Job> dropped;
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        seq_.fetch_add(1, std::memory_order_relaxed);
+        dropped = std::move(pending_);
+        pending_.reset();
+    }
+    wake();
+    if (dropped) {
+        reportDropped(*dropped);
+    }
 }
 
 bool LlmWorker::isCurrent(uint64_t seq) const {
@@ -247,16 +300,10 @@ void LlmWorker::run() {
         if (result.cancelled && !result.ok) {
             result.error = "cancelled";
         }
-        // Observation is intentionally not current-only and receives a copy.
-        // It also runs while stop() waits; the owner must guard posted UI work.
-        if (job->observed) {
-            job->observed(result);
-        }
-        // Parsing/sanitizing/observation may take time. Check immediately before
-        // delivery; the main-thread consumer must also validate result.seq,
-        // since a request can be superseded after this check or while queued.
-        if (job->callback && isCurrent(job->seq)) {
-            job->callback(std::move(result));
+        // The consumer decides on its main thread whether this is still the
+        // current input; cancelled results are delivered for diagnostics only.
+        if (job->handler) {
+            job->handler(FetchStage::Finished, result);
         }
     }
 }
@@ -283,7 +330,6 @@ bool LlmWorker::perform(
     }
 
     WriteSink sink;
-    TransferState transfer{this, job.seq};
     // The timeout must be per request: a shorter budget is deliberately used
     // here than cloudpinyin's hardcoded 10s because a slow reply is useless
     // once the user has typed past it.
@@ -315,9 +361,7 @@ bool LlmWorker::perform(
             error = "invalid post body";
             break;
         }
-        if (curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &sink) != CURLE_OK ||
-            curl_easy_setopt(curl_, CURLOPT_XFERINFODATA, &transfer) !=
-                CURLE_OK) {
+        if (curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &sink) != CURLE_OK) {
             error = "invalid transfer callbacks";
             break;
         }
@@ -331,11 +375,11 @@ bool LlmWorker::perform(
         // A started transfer remains counted even when its reply is discarded.
         startedAt = std::chrono::steady_clock::now();
         requestsStarted_.fetch_add(1, std::memory_order_relaxed);
-        if (job.started) {
-            job.started();
-        }
         result.started = true;
-        const auto code = curl_easy_perform(curl_);
+        if (job.handler) {
+            job.handler(FetchStage::Started, result);
+        }
+        const auto code = transfer(job.seq);
         // CURLINFO_RESPONSE_CODE can be available even when a response body
         // overflows, a transfer times out, or a late cancellation aborts it.
         curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &result.httpStatus);
@@ -364,15 +408,49 @@ bool LlmWorker::perform(
     curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, 0L);
     curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, nullptr);
     curl_easy_setopt(curl_, CURLOPT_WRITEDATA, nullptr);
-    curl_easy_setopt(curl_, CURLOPT_XFERINFODATA, nullptr);
     curl_slist_free_all(headers);
     return ok;
 }
 
-int LlmWorker::progressCallback(void *userdata, curl_off_t, curl_off_t,
-                                curl_off_t, curl_off_t) {
-    const auto *transfer = static_cast<const TransferState *>(userdata);
-    return transfer && transfer->worker->isCurrent(transfer->seq) ? 0 : 1;
+CURLcode LlmWorker::transfer(uint64_t seq) {
+    // curl_easy_perform only notices cancellation at its progress callback,
+    // which fires about once per second while waiting for a slow model. Driving
+    // the same handle through curl_multi lets submit()/cancelAll() wake the
+    // poll immediately.
+    if (curl_multi_add_handle(multi_, curl_) != CURLM_OK) {
+        return CURLE_FAILED_INIT;
+    }
+    CURLcode result = CURLE_OK;
+    int running = 1;
+    while (running > 0) {
+        if (!isCurrent(seq)) {
+            result = CURLE_ABORTED_BY_CALLBACK;
+            break;
+        }
+        if (curl_multi_perform(multi_, &running) != CURLM_OK) {
+            result = CURLE_RECV_ERROR;
+            break;
+        }
+        if (running == 0) {
+            break;
+        }
+        // Bounded so a missed wakeup can never wedge the worker.
+        if (curl_multi_poll(multi_, nullptr, 0, 250, nullptr) != CURLM_OK) {
+            result = CURLE_RECV_ERROR;
+            break;
+        }
+    }
+    if (running == 0) {
+        int queued = 0;
+        result = CURLE_RECV_ERROR;
+        while (auto *message = curl_multi_info_read(multi_, &queued)) {
+            if (message->msg == CURLMSG_DONE && message->easy_handle == curl_) {
+                result = message->data.result;
+            }
+        }
+    }
+    curl_multi_remove_handle(multi_, curl_);
+    return result;
 }
 
 size_t LlmWorker::writeCallback(char *ptr, size_t size, size_t nmemb,

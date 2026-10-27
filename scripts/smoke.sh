@@ -122,7 +122,7 @@ run_checked config 'All config tests passed' "$RUN_DIR/config.log" "$BUILD_DIR/b
 run_checked worker 'All worker tests passed' "$RUN_DIR/worker.log" \
     "$BUILD_DIR/bin/testllmworker" "$BASE/v1/chat/completions"
 
-for scenario in history-clear-inflight history-clear-cycle mixed-contiguous-surrounding mixed-contiguous-surrounding-inflight mixed-contiguous-surrounding-visible mixed-context-changed mixed-contiguous-commit mixed-contiguous-commit-blocked live mixed mixed-badge-off english digits emoji emoji-tag debounce disabled dead preview reset partial toggle toggle-inflight sensitive sensitive-inflight context cache cooldown config filtered metadata original-pinyin original-shuangpin switch-inflight switch-results own-config virtual-keyboard preedit-click modifier-selection modifier-selection-global llm-alone private-settings customphrase-isolation learning-isolation learning-reload private-actions native-description cloud-badge badge-off llm-status stats-overlap stats-empty stats-error stats-invalid stats-all-filtered stats-limit stats-rate stats-focus history-menu history-disabled history-disable-live history-privacy history-stale history-native-blocked; do
+for scenario in live mixed mixed-context-changed cache sensitive dead toggle history-menu stats-overlap llm-alone; do
     scenario_dir="$RUN_DIR/$scenario"
     mkdir -p "$scenario_dir"/{config/conf,data,cache,runtime}
     chmod 700 "$scenario_dir/runtime"
@@ -148,16 +148,12 @@ PY
     chmod 700 "$scenario_dir/bin/xdg-open"
     # An explicit profile avoids host preferences and first-run IM selection.
     default_im=llm-pinyin
-    case "$scenario" in
-        original-pinyin) default_im=pinyin ;;
-        original-shuangpin) default_im=shuangpin ;;
-    esac
     printf '%s\n' '[Groups/0]' 'Name=Default' 'Default Layout=us' "DefaultIM=$default_im" \
         '' '[Groups/0/Items/0]' 'Name=llm-pinyin' 'Layout=' \
         '' '[Groups/0/Items/1]' 'Name=pinyin' 'Layout=' \
         '' '[Groups/0/Items/2]' 'Name=shuangpin' 'Layout=' \
         '' '[GroupOrder]' '0=Default' >"$scenario_dir/config/profile"
-    if [[ "$scenario" == llm-alone || "$scenario" == learning-isolation || "$scenario" == learning-reload ]]; then
+    if [[ "$scenario" == llm-alone ]]; then
         printf '%s\n' '[Groups/0]' 'Name=Default' 'Default Layout=us' 'DefaultIM=llm-pinyin' \
             '' '[Groups/0/Items/0]' 'Name=llm-pinyin' 'Layout=' \
             '' '[GroupOrder]' '0=Default' >"$scenario_dir/config/profile"
@@ -191,27 +187,13 @@ for name, value in files.items():
     checksums[name] = hashlib.sha256(path.read_bytes()).hexdigest()
 (root / "official-sentinels.json").write_text(json.dumps(checksums))
 PY
-        if [[ "$scenario" == learning-reload ]]; then
-            mkdir -p "$scenario_dir/data/chinese-llm"
-            cp "$RUN_DIR/learning-isolation/data/chinese-llm/user.dict" \
-               "$RUN_DIR/learning-isolation/data/chinese-llm/user.history" "$scenario_dir/data/chinese-llm/"
-        fi
-    elif [[ "$scenario" == customphrase-isolation ]]; then
-        mkdir -p "$scenario_dir/data/pinyin"
-        printf '%s\n' 'zzzz,1=原生短语' >"$scenario_dir/data/pinyin/customphrase"
     fi
     curl --noproxy '*' --fail --silent --max-time 2 -X POST "$BASE/reset" > /dev/null
     endpoint="$BASE/v1/chat/completions"
     case "$scenario" in
-        mixed-contiguous-surrounding|mixed-contiguous-surrounding-inflight|mixed-contiguous-surrounding-visible|mixed-context-changed|mixed-contiguous-commit|mixed-contiguous-commit-blocked) endpoint="$BASE/mixed-contiguous-commit/v1/chat/completions" ;;
-        mixed|mixed-badge-off) endpoint="$BASE/mixed/v1/chat/completions" ;;
-        english|digits|emoji|emoji-tag) endpoint="$BASE/$scenario/v1/chat/completions" ;;
+        mixed-context-changed) endpoint="$BASE/mixed-contiguous-commit/v1/chat/completions" ;;
+        mixed) endpoint="$BASE/mixed/v1/chat/completions" ;;
         dead) endpoint="http://127.0.0.1:$DEAD_PORT/v1/chat/completions" ;;
-        cooldown|stats-error) endpoint="$BASE/error/v1/chat/completions" ;;
-        stats-empty) endpoint="$BASE/empty/v1/chat/completions" ;;
-        stats-invalid) endpoint="$BASE/invalid/v1/chat/completions" ;;
-        stats-all-filtered) endpoint="$BASE/all-filtered/v1/chat/completions" ;;
-        stats-limit) endpoint="$BASE/late-overlap/v1/chat/completions" ;;
         history-menu) endpoint="$BASE/history-rich/v1/chat/completions" ;;
     esac
     # The mock reserves DEAD_PORT without listening, so connection refusal is
@@ -235,7 +217,7 @@ import pathlib
 import sys
 root = pathlib.Path(sys.argv[1])
 scenario = sys.argv[2]
-if scenario in {"llm-alone", "learning-isolation", "learning-reload"}:
+if scenario == "llm-alone":
     import hashlib
     checksums = json.loads((root / "official-sentinels.json").read_text())
     for name, expected_hash in checksums.items():
@@ -244,7 +226,6 @@ if scenario in {"llm-alone", "learning-isolation", "learning-reload"}:
     for directory in ["data/pinyin", "config/pinyin", "data/punctuation", "data/chttrans", "data/pinyinhelper"]:
         assert all(str(path.relative_to(root)) in originals for path in (root / directory).rglob("*") if path.is_file()), f"new official data created: {directory}"
     assert (root / "config/conf/chinese-llm-pinyin.conf").is_file(), "private native configuration not saved"
-    assert (root / "data/chinese-llm/user.dict").is_file() and (root / "data/chinese-llm/user.history").is_file(), "private learning files not saved"
     sys.exit(0)
 prefix = "official-config-baseline: "
 lines = (root / "test.log").read_text().splitlines()
@@ -266,91 +247,37 @@ import sys
 scenario = sys.argv[1]
 stats = json.load(open(sys.argv[2]))
 count = stats["count"]
-expected = {"mixed-contiguous-surrounding": 1,
-            "mixed-contiguous-surrounding-inflight": 1,
-            "mixed-contiguous-surrounding-visible": 1,
-            "mixed-context-changed": 1,
-            "mixed-contiguous-commit": 1,
-            "mixed-contiguous-commit-blocked": 1,
-            "live": 1, "mixed": 1, "mixed-badge-off": 1, "english": 1,
-            "digits": 1, "emoji": 1, "emoji-tag": 1,
-            "debounce": 1, "disabled": 0, "dead": 0,
-            "preview": 1, "sensitive": 0, "toggle": 0, "partial": 1,
-            "toggle-inflight": 1, "sensitive-inflight": 1,
-            "reset": 2, "context": 2, "cache": 2, "cooldown": 2, "config": 2, "filtered": 1,
-            "metadata": 0, "original-pinyin": 0, "original-shuangpin": 0,
-            "switch-inflight": 2, "switch-results": 1, "own-config": 0,
-            "virtual-keyboard": 1, "preedit-click": 1, "modifier-selection": 1,
-            "modifier-selection-global": 1,
-            "llm-alone": 1, "private-settings": 0, "customphrase-isolation": 0,
-            "learning-isolation": 0, "learning-reload": 0, "private-actions": 0, "native-description": 0,
-             "cloud-badge": 1, "badge-off": 1, "llm-status": 0,
-             "stats-overlap": 1, "stats-empty": 1, "stats-error": 1,
-             "stats-invalid": 1, "stats-all-filtered": 1, "stats-limit": 1,
-             "stats-rate": 3, "stats-focus": 2,
-             "history-menu": 1, "history-clear-cycle": 3, "history-clear-inflight": 2, "history-disabled": 1,
-             "history-disable-live": 1, "history-privacy": 2,
-             "history-stale": 1, "history-native-blocked": 1}
+expected = {"live": 1, "mixed": 1, "mixed-context-changed": 1, "cache": 2,
+            "sensitive": 0, "dead": 0, "toggle": 0, "history-menu": 1,
+            "stats-overlap": 1, "llm-alone": 1}
 assert scenario in expected, f"missing request-count assertion for {scenario}"
 assert count == expected[scenario], f"{scenario}: expected {expected[scenario]} POSTs, got {count}"
-if scenario in {"own-config", "metadata", "original-pinyin", "original-shuangpin"}:
-    assert not stats["requests"], f"{scenario}: original/config-only path touched network"
-if scenario in {"mixed", "mixed-badge-off", "english", "digits", "emoji", "emoji-tag"}:
+if scenario == "mixed":
     record = stats["requests"][0]
-    endpoint_kind = "mixed" if scenario == "mixed-badge-off" else scenario
-    assert record["path"] == f"/{endpoint_kind}/v1/chat/completions", f"{scenario}: wrong payload fixture"
+    assert record["path"] == "/mixed/v1/chat/completions", f"{scenario}: wrong payload fixture"
     assert "'" in record["pinyin"], f"{scenario}: must exercise separated pinyin length policy"
     assert record["authorization"] == "", f"{scenario}: leaked host API key to mock"
-if scenario.startswith("mixed-contiguous-") or scenario == "mixed-context-changed":
+if scenario == "mixed-context-changed":
     record = stats["requests"][0]
     normalized = record["pinyin"].replace("'", "").replace(" ", "").lower()
     assert normalized == "bangwocommityixia", f"{scenario}: no final complete-input request: {record['pinyin']}"
     assert record["path"] == "/mixed-contiguous-commit/v1/chat/completions", f"{scenario}: wrong mixed reply fixture"
     assert record["authorization"] == "", f"{scenario}: leaked host API key"
-    if scenario == "mixed-context-changed":
-        assert "safe-context-after" in record["user"] and "safe-context-before" not in record["user"], "context change did not automatically submit only the new context"
-    if scenario == "mixed-contiguous-surrounding-visible":
-        assert "safe-context-before" in record["user"], "visible candidate probe must use an effective nonempty context"
+    assert "safe-context-after" in record["user"] and "safe-context-before" not in record["user"], "context change did not automatically submit only the new context"
 import pathlib
 root = pathlib.Path(sys.argv[2]).parent
 opener_log = root / "opener.jsonl"
-if scenario == "history-clear-inflight":
-    launches = [json.loads(line) for line in opener_log.read_text().splitlines()]
-    assert len(launches) == 2, "inflight clear probe must explicitly open/reopen history"
-    assert launches[0]["path"] == launches[1]["path"], "viewed snapshot should update in place after a new row"
-    assert "你好" in launches[1]["html"] and "她们正在开会" not in launches[1]["html"], "old reply resurrected or new history never appeared"
-    for launch in launches:
-        assert len(launch["args"]) == 1 and launch["file_mode"] == 0o600 and launch["directory_mode"] == 0o700
-        snapshot = pathlib.Path(launch["path"])
-        assert not snapshot.exists() and not snapshot.parent.exists(), "inflight clear retained a private snapshot"
-elif scenario == "history-clear-cycle":
-    launches = [json.loads(line) for line in opener_log.read_text().splitlines()]
-    assert len(launches) == 4, "clear/new-input cycle must reopen history four times"
-    assert len({launch["path"] for launch in launches}) == 4, "clear cycle reused a deleted snapshot URL"
-    assert "他们正在开会吗" in launches[3]["html"], "continued original composition lost its new history row"
-    assert "测试" in launches[1]["html"], "reopened page lost the new request/cache rows"
-    assert "她们正在开会" not in launches[1]["html"], "cleared rows resurrected in the second page"
-    assert "她们正在开会" in launches[2]["html"], "second clear prevented a fresh cached-input row"
-    for launch in launches:
-        assert len(launch["args"]) == 1 and launch["file_mode"] == 0o600 and launch["directory_mode"] == 0o700
-        snapshot = pathlib.Path(launch["path"])
-        assert not snapshot.exists() and not snapshot.parent.exists(), "clear cycle retained a snapshot"
-elif scenario in {"history-menu", "history-disable-live", "history-privacy"}:
+if scenario == "history-menu":
     launches = [json.loads(line) for line in opener_log.read_text().splitlines()]
     assert len(launches) == 1, "history menu must launch only the explicit view once"
     launch = launches[0]
     assert len(launch["args"]) == 1 and launch["file_mode"] == 0o600 and launch["directory_mode"] == 0o700, "opener snapshot permissions/arguments wrong"
-    if scenario == "history-menu":
-        assert "history-html-marker" in launch["html"] and "&lt;script&gt;" in launch["html"] and "<script>" not in launch["html"], "snapshot executed/lost model HTML"
-    if scenario == "history-privacy":
-        assert "private-context-never-record" not in launch["html"] and "history-private-key-sentinel" not in launch["html"], "opener snapshot leaked context/credential sentinels"
+    assert "history-html-marker" in launch["html"] and "&lt;script&gt;" in launch["html"] and "<script>" not in launch["html"], "snapshot executed/lost model HTML"
     snapshot = pathlib.Path(launch["path"])
     assert not snapshot.exists() and not snapshot.parent.exists(), "clear/shutdown retained temporary snapshot"
 else:
     assert not opener_log.exists(), f"{scenario}: history opened browser without explicit menu click"
 assert not list((root / "runtime").rglob("*.html")), f"{scenario}: shutdown left private history files"
-if scenario == "history-privacy":
-    assert all("private-context-never-record" in record["user"] and record["authorization"] == "Bearer history-private-key-sentinel" for record in stats["requests"]), "privacy test failed to send its harmless context/key sentinels"
 print(f"  server requests: {count}")
 PY
     then

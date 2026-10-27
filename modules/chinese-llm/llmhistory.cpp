@@ -159,8 +159,7 @@ void wipe(std::vector<std::string> &texts) {
 void wipe(RequestHistoryEntry &entry) {
     wipe(entry.pinyin);
     wipe(entry.model);
-    wipe(entry.status);
-    wipe(entry.content);
+        wipe(entry.content);
     wipe(entry.error);
     wipe(entry.adoption);
     wipe(entry.adoptedText);
@@ -172,18 +171,20 @@ void wipe(RequestHistoryEntry &entry) {
     std::vector<RejectedCandidate>().swap(entry.rejected);
 }
 
-std::string statusLabel(const std::string &status) {
-    if (status == "queued") return "排队 / Queued";
-    if (status == "inflight") return "请求中 / In flight";
-    if (status == "cache_hit") return "缓存命中 / Cache hit";
-    if (status == "cancelled") return "已取消 / Cancelled";
-    if (status == "error") return "错误 / Error";
-    if (status == "empty") return "空响应 / Empty";
-    if (status == "filtered") return "全部被拒绝 / Filtered";
-    if (status == "completed") return "已完成 / Completed";
-    if (status == "usable") return "可用 / Usable";
-    if (status == "stale") return "已过期 / Stale";
-    return escapeHtml(status);
+std::string statusLabel(RequestStatus status) {
+    switch (status) {
+    case RequestStatus::Queued: return "排队 / Queued";
+    case RequestStatus::InFlight: return "请求中 / In flight";
+    case RequestStatus::CacheHit: return "缓存命中 / Cache hit";
+    case RequestStatus::Cancelled: return "已取消 / Cancelled";
+    case RequestStatus::Error: return "错误 / Error";
+    case RequestStatus::Empty: return "空响应 / Empty";
+    case RequestStatus::Filtered: return "全部被拒绝 / Filtered";
+    case RequestStatus::Completed: return "已完成 / Completed";
+    case RequestStatus::Usable: return "可用 / Usable";
+    case RequestStatus::Stale: return "已过期 / Stale";
+    }
+    return "";
 }
 
 bool validRuntimeDirectory(const char *path) {
@@ -234,7 +235,7 @@ uint64_t RequestHistory::begin(std::string pinyin, std::string model) {
     return nextId_;
 }
 
-RequestHistoryEntry *RequestHistory::find(uint64_t id) {
+RequestHistoryEntry *RequestHistory::mutableEntry(uint64_t id) {
     const auto found = std::find_if(entries_.begin(), entries_.end(),
         [id](const auto &entry) { return entry.id == id; });
     return found == entries_.end() ? nullptr : &*found;
@@ -246,10 +247,97 @@ const RequestHistoryEntry *RequestHistory::find(uint64_t id) const {
     return found == entries_.end() ? nullptr : &*found;
 }
 
-void RequestHistory::complete(uint64_t id, const FetchResult &result) {
-    auto *entry = find(id);
+uint64_t RequestHistory::recordCacheHit(
+    std::string pinyin, std::string model,
+    const std::vector<std::string> &candidates, bool overlap) {
+    const auto id = begin(std::move(pinyin), std::move(model));
+    auto *entry = mutableEntry(id);
+    if (!entry) {
+        return 0;
+    }
+    for (size_t i = 0; i < std::min(candidates.size(), MaxCandidates); ++i) {
+        entry->candidates.push_back(displayText(candidates[i], MaxTextBytes));
+    }
+    setIdentities(id, candidates);
+    entry->status = RequestStatus::CacheHit;
+    entry->overlap = overlap;
+    return id;
+}
+
+void RequestHistory::setSeq(uint64_t id, uint64_t seq) {
+    if (auto *entry = mutableEntry(id)) {
+        entry->seq = seq;
+    }
+}
+
+void RequestHistory::markStarted(uint64_t id) {
+    if (auto *entry = mutableEntry(id)) {
+        entry->started = true;
+        if (entry->status == RequestStatus::Queued) {
+            entry->status = RequestStatus::InFlight;
+        }
+    }
+}
+
+void RequestHistory::markCancelled(uint64_t id, std::string reason) {
+    auto *entry = mutableEntry(id);
+    if (entry && (entry->status == RequestStatus::Queued ||
+                  entry->status == RequestStatus::InFlight)) {
+        entry->status = RequestStatus::Cancelled;
+        wipe(entry->error);
+        entry->error = displayText(reason, MaxTextBytes);
+    }
+}
+
+void RequestHistory::markUsable(uint64_t id, bool overlap) {
+    if (auto *entry = mutableEntry(id)) {
+        entry->status = RequestStatus::Usable;
+        entry->overlap = overlap;
+    }
+}
+
+void RequestHistory::markStale(uint64_t id) {
+    if (auto *entry = mutableEntry(id)) {
+        entry->status = RequestStatus::Stale;
+        wipe(entry->error);
+        entry->error = "Reply no longer matches the current input";
+    }
+}
+
+bool RequestHistory::adoptable(uint64_t id) const {
+    const auto *entry = find(id);
+    return entry && entry->adoption.empty() &&
+           (entry->status == RequestStatus::Usable ||
+            entry->status == RequestStatus::CacheHit);
+}
+
+void RequestHistory::setIdentities(uint64_t id,
+                                   const std::vector<std::string> &candidates) {
+    auto &identities = candidateIdentities_[id];
+    wipe(identities);
+    // Display truncation must not suppress adoption tracking: native duplicate
+    // removal can make the 33rd (or later) LLM candidate visible in the UI.
+    size_t identityBytes = 0;
+    for (const auto &text : candidates) {
+        if (!text.empty() && text.size() <= MaxIdentityBytes - identityBytes) {
+            identities.push_back(text);
+            identityBytes += text.size();
+        }
+        if (identityBytes == MaxIdentityBytes) {
+            break;
+        }
+    }
+}
+
+void RequestHistory::finish(uint64_t id, const FetchResult &result) {
+    auto *entry = mutableEntry(id);
     if (!entry) {
         return;
+    }
+    // A cancellation recorded by the owner names the real cause; keep it.
+    std::string reason;
+    if (result.cancelled && entry->status == RequestStatus::Cancelled) {
+        reason = entry->error;
     }
     entry->seq = result.seq;
     entry->started = result.started;
@@ -268,43 +356,34 @@ void RequestHistory::complete(uint64_t id, const FetchResult &result) {
         wipe(rejected.reason);
     }
     entry->rejected.clear();
-    auto &identities = candidateIdentities_[id];
-    wipe(identities);
     for (size_t i = 0; i < std::min(result.candidates.size(), MaxCandidates); ++i) {
         entry->candidates.push_back(displayText(result.candidates[i], MaxTextBytes));
     }
-    // Display truncation must not suppress adoption tracking: native duplicate
-    // removal can make the 33rd (or later) LLM candidate visible in the UI.
-    size_t identityBytes = 0;
-    for (const auto &text : result.candidates) {
-        if (!text.empty() && text.size() <= MaxIdentityBytes - identityBytes) {
-            identities.push_back(text);
-            identityBytes += text.size();
-        }
-        if (identityBytes == MaxIdentityBytes) {
-            break;
-        }
-    }
+    setIdentities(id, result.candidates);
     for (size_t i = 0; i < std::min(result.rejected.size(), MaxCandidates); ++i) {
         const auto &candidate = result.rejected[i];
         entry->rejected.push_back({displayText(candidate.text, MaxTextBytes),
                                   displayText(candidate.reason, MaxTextBytes)});
     }
     if (result.cancelled) {
-        entry->status = "cancelled";
+        entry->status = RequestStatus::Cancelled;
+        if (!reason.empty()) {
+            wipe(entry->error);
+            entry->error = std::move(reason);
+        }
     } else if (!result.ok) {
-        entry->status = "error";
+        entry->status = RequestStatus::Error;
     } else if (!entry->candidates.empty()) {
-        entry->status = "completed";
+        entry->status = RequestStatus::Completed;
     } else if (!result.rejected.empty()) {
-        entry->status = "filtered";
+        entry->status = RequestStatus::Filtered;
     } else {
-        entry->status = "empty";
+        entry->status = RequestStatus::Empty;
     }
 }
 
 void RequestHistory::adopt(uint64_t id, std::string text, bool native) {
-    auto *entry = find(id);
+    auto *entry = mutableEntry(id);
     const auto identities = candidateIdentities_.find(id);
     if (!entry || identities == candidateIdentities_.end() ||
         std::find(identities->second.begin(), identities->second.end(), text) ==
@@ -501,9 +580,8 @@ bool HistorySnapshot::write(const std::string &html) {
             offset += static_cast<size_t>(written);
         }
     }
-    if (ok && ::fsync(fd) != 0) {
-        ok = false;
-    }
+    // No fsync: the snapshot is a disposable view regenerated from memory, and
+    // a synchronous flush would stall the input thread on slow disks.
     if (::close(fd) != 0) {
         ok = false;
     }
