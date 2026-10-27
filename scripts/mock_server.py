@@ -21,11 +21,13 @@ REPLIES = {
     "nihao": ["你好"],
     "ni'hao": ["你好"],
     "ta'men'zheng'zai'kai'hui": ["他们正在开会", "她们正在开会"],
+    "ta'men'zheng'zai'kai'hui'ma": ["他们正在开会吗"],
     "jin'tian'tian'qi'bu'cuo": ["今天天气不错"],
     "wo'zai'xue'xi": ["我在学习"],
     "nihao'ya": ["你好呀"],
     "nhsj": ["你换手机"],
     "ceshi": ["测试"],
+    "ce'shi": ["测试"],
     "shui": ["谁"],
 }
 # Keep semantic candidate bytes independent of how the native engine segments

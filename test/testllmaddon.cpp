@@ -414,6 +414,8 @@ int main(int argc, char **argv) {
                                              "stats-rate",
                                              "stats-focus",
                                              "history-menu",
+                                             "history-clear-cycle",
+                                             "history-clear-inflight",
                                              "history-disabled",
                                              "history-disable-live",
                                              "history-privacy",
@@ -457,6 +459,7 @@ int main(int argc, char **argv) {
     int statisticsStatusUpdates = 0;
     std::unique_ptr<HandlerTableEntry<EventHandler>> statisticsWatcher;
     std::unique_ptr<HandlerTableEntry<EventHandler>> focusWatcher;
+    std::vector<std::string> historyPublishedLabels;
     std::vector<ScopedConnection> focusActionConnections;
     InputContext *dormantIc = nullptr;
     ICUUID dormantUuid{};
@@ -697,6 +700,8 @@ int main(int argc, char **argv) {
                 {"stats-rate", {3, 3, 2}},
                 {"stats-focus", {2, 0, 0}},
                 {"history-menu", {1, 1, 1}},
+                {"history-clear-cycle", {3, 3, 3}},
+                {"history-clear-inflight", {2, 1, 1}},
                 {"history-disabled", {1, 1, 1}},
                 {"history-disable-live", {1, 1, 1}},
                 {"history-privacy", {2, 1, 1}},
@@ -832,7 +837,8 @@ int main(int argc, char **argv) {
                 scenario == "history-privacy" ||
                 scenario == "history-disabled" ||
                 scenario == "history-disable-live" ||
-                scenario == "history-menu" || original || counts.sent == 0) {
+                scenario == "history-menu" || scenario == "history-clear-cycle" ||
+                scenario == "history-clear-inflight" || original || counts.sent == 0) {
                 require(entries.empty(),
                         "disabled/cleared/sensitive/official path retained "
                         "request history");
@@ -1082,7 +1088,8 @@ int main(int argc, char **argv) {
             config.setValueByPath("CacheSize",
                                   scenario == "cache" || scenario == "config" ||
                                           scenario == "switch-results" ||
-                                          scenario == "history-menu"
+                                          scenario == "history-menu" ||
+                                          scenario == "history-clear-cycle"
                                       ? "256"
                                       : "0");
             config.setValueByPath("MaxConsecutiveErrors", "2");
@@ -1184,6 +1191,15 @@ int main(int argc, char **argv) {
                 });
             checkStatistics(0, 0, 0);
             clickStatistics();
+            if (scenario == "history-clear-cycle" || scenario == "history-clear-inflight") {
+                auto *history = instance.userInterfaceManager().lookupAction("chinese-llm-history");
+                focusActionConnections.emplace_back(history->connect<Action::Update>(
+                    [&, history](InputContext *target) {
+                        if (target == ic) {
+                            historyPublishedLabels.push_back(history->shortText(target));
+                        }
+                    }));
+            }
             if (scenario == "stats-focus") {
                 dormantIc = ic;
                 dormantUuid = uuid;
@@ -1936,6 +1952,211 @@ int main(int argc, char **argv) {
                                 llmAddon->requestHistory().entries();
                             if (!entries.empty() &&
                                 entries.back().status == "stale") {
+                                finish(true, "");
+                            }
+                        } else if (scenario == "history-clear-inflight") {
+                            auto *view = instance.userInterfaceManager().lookupAction("chinese-llm-history");
+                            auto *clear = instance.userInterfaceManager().lookupAction("chinese-llm-history-clear");
+                            if (stage == 0 && llmAddon->requestStatistics().sent == 1) {
+                                require(!appeared && state()->requestSeq != 0 &&
+                                            llmAddon->requestHistory().entries().size() == 1,
+                                        "inflight-clear probe did not reach an unfinished network request");
+                                generation = llmAddon->requestHistory().entries().back().id;
+                                clear->activate(ic);
+                                require(llmAddon->requestHistory().entries().empty() &&
+                                            llmAddon->historySnapshotPath().empty(),
+                                        "inflight clear retained the old row/snapshot");
+                                // Reopen an empty page before the replacement
+                                // input completes; it must later update in place.
+                                view->activate(ic);
+                                viewedSnapshot = llmAddon->historySnapshotPath();
+                                checkPrivateSnapshot(viewedSnapshot);
+                                ic->reset();
+                                type("nihao");
+                                stage = 1;
+                            } else if (stage == 1 &&
+                                       !llmAddon->requestHistory().entries().empty() &&
+                                       llmAddon->requestHistory().entries().back().status == "usable" &&
+                                       openerRecorded()) {
+                                const auto &entries = llmAddon->requestHistory().entries();
+                                require(entries.size() == 1 && entries.back().id > generation &&
+                                            entries.back().content == "你好" &&
+                                            entries.back().httpStatus == 200 && hasCandidate(ic, "你好"),
+                                        "late old callbacks erased/resurrected rows or blocked new candidates");
+                                const auto label = view->shortText(ic);
+                                require((label == "LLM request history 1" || label == "LLM 请求历史 1") &&
+                                            !historyPublishedLabels.empty() &&
+                                            historyPublishedLabels.back() == label,
+                                        "replacement request failed to publish the post-clear menu count");
+                                checkStatistics(2, 1, 1);
+                                const auto html = readTestData(viewedSnapshot);
+                                require(html.find("你好") != std::string::npos &&
+                                            html.find(kModelWord) == std::string::npos,
+                                        "empty snapshot did not refresh or revived cleared response text");
+                                view->activate(ic);
+                                stage = 2;
+                            } else if (stage == 2) {
+                                std::istringstream lines(readTestData(openerLogPath()));
+                                std::string line;
+                                std::vector<nlohmann::json> launches;
+                                while (std::getline(lines, line)) {
+                                    auto record = nlohmann::json::parse(line, nullptr, false);
+                                    if (record.is_object()) launches.push_back(std::move(record));
+                                }
+                                if (launches.size() == 2) {
+                                    require(launches.back().at("path") == viewedSnapshot &&
+                                                launches.back().at("html").get<std::string>().find("你好") !=
+                                                    std::string::npos,
+                                            "explicit post-clear reopening still displayed an empty page");
+                                    clear->activate(ic);
+                                    require(llmAddon->requestHistory().entries().empty() &&
+                                                !std::filesystem::exists(viewedSnapshot),
+                                            "final inflight probe clear retained data");
+                                    ic->reset();
+                                    finish(true, "");
+                                }
+                            }
+                        } else if (scenario == "history-clear-cycle") {
+                            auto *view = instance.userInterfaceManager().lookupAction(
+                                "chinese-llm-history");
+                            auto *clear = instance.userInterfaceManager().lookupAction(
+                                "chinese-llm-history-clear");
+                            auto checkCount = [&](size_t count) {
+                                const auto label = view->shortText(ic);
+                                require(llmAddon->requestHistory().entries().size() == count &&
+                                            (label == "LLM request history " + std::to_string(count) ||
+                                             label == "LLM 请求历史 " + std::to_string(count)),
+                                        "history memory/menu count disagree after clear/new input: " + label);
+                                require(!historyPublishedLabels.empty() &&
+                                            historyPublishedLabels.back() == label,
+                                        "history changed its label but did not publish a menu action update");
+                            };
+                            auto launches = [&] {
+                                std::vector<nlohmann::json> records;
+                                if (std::filesystem::exists(openerLogPath())) {
+                                    std::istringstream lines(readTestData(openerLogPath()));
+                                    std::string line;
+                                    while (std::getline(lines, line)) {
+                                        auto record = nlohmann::json::parse(line, nullptr, false);
+                                        if (record.is_object()) records.push_back(std::move(record));
+                                    }
+                                }
+                                return records;
+                            };
+                            if (stage == 0 && appeared) {
+                                checkCount(1);
+                                view->activate(ic);
+                                viewedSnapshot = llmAddon->historySnapshotPath();
+                                checkPrivateSnapshot(viewedSnapshot);
+                                stage = 1;
+                            } else if (stage == 1 && launches().size() == 1) {
+                                const auto oldId = llmAddon->requestHistory().entries().back().id;
+                                // Mirror a shell menu opening: its most-recent IC
+                                // is temporarily unfocused, but owns the actions.
+                                ic->focusOut();
+                                require(instance.mostRecentInputContext() == ic,
+                                        "history clear shell probe lost most-recent context");
+                                clear->activate(ic);
+                                checkCount(0);
+                                require(llmAddon->historySnapshotPath().empty() &&
+                                            !std::filesystem::exists(viewedSnapshot),
+                                        "clear left the first browser snapshot alive");
+                                checkStatistics(1, 1, 1);
+                                require(configSnapshot(llm->getConfig()).find("RecordHistory=False") ==
+                                            std::string::npos,
+                                        "clear disabled recording");
+                                generation = oldId;
+                                ic->focusIn();
+                                ic->reset();
+                                type("ceshi"); // New uncached network request.
+                                stage = 2;
+                            } else if (stage == 2 &&
+                                       !llmAddon->requestHistory().entries().empty() &&
+                                       llmAddon->requestHistory().entries().back().status == "usable") {
+                                checkCount(1);
+                                const auto &entry = llmAddon->requestHistory().entries().back();
+                                require(entry.id > generation && entry.started &&
+                                            entry.content == "测试" && entry.httpStatus == 200,
+                                        "fresh request after clear lost diagnostics or reused an ID");
+                                checkStatistics(2, 2, 2);
+                                frontend->call<ITestFrontend::pushCommitExpectation>("测试");
+                                selectCandidate(ic, "测试");
+                                type("ceshi"); // Same input, now a real cache hit.
+                                checkCount(2);
+                                require(llmAddon->requestHistory().entries().back().status == "cache_hit" &&
+                                            !llmAddon->requestHistory().entries().back().started,
+                                        "cache hit after clear did not create a new row");
+                                view->activate(ic);
+                                const auto newPath = llmAddon->historySnapshotPath();
+                                require(newPath != viewedSnapshot && !newPath.empty(),
+                                        "reopening after clear reused the deleted snapshot URL");
+                                viewedSnapshot = newPath;
+                                checkPrivateSnapshot(viewedSnapshot);
+                                const auto html = readTestData(viewedSnapshot);
+                                require(html.find("测试") != std::string::npos &&
+                                            html.find(kModelWord) == std::string::npos,
+                                        "reopened page is empty or resurrected cleared records");
+                                stage = 3;
+                            } else if (stage == 3 && launches().size() == 2) {
+                                require(launches().back().at("path") == viewedSnapshot &&
+                                            launches().back().at("html").get<std::string>().find("测试") !=
+                                                std::string::npos,
+                                        "actual reopened browser snapshot lacks new history");
+                                clear->activate(ic);
+                                checkCount(0);
+                                require(!std::filesystem::exists(viewedSnapshot),
+                                        "second clear retained its snapshot");
+                                ic->reset();
+                                type(kKeys); // Original cached keys must also resume history.
+                                checkCount(1);
+                                require(llmAddon->requestHistory().entries().back().status == "cache_hit" &&
+                                            hasCandidate(ic, kModelWord),
+                                        "second clear prevented logging an existing cached composition");
+                                checkStatistics(2, 2, 2);
+                                view->activate(ic);
+                                const auto newPath = llmAddon->historySnapshotPath();
+                                require(newPath != viewedSnapshot &&
+                                            readTestData(newPath).find(kModelWord) != std::string::npos,
+                                        "second reopened snapshot is empty");
+                                viewedSnapshot = newPath;
+                                stage = 4;
+                            } else if (stage == 4 && launches().size() == 3) {
+                                require(launches().back().at("path") == viewedSnapshot,
+                                        "third explicit history launch used a stale URL");
+                                const auto beforePinyin = state()->pinyin;
+                                const auto beforeGeneration = state()->generation;
+                                clear->activate(ic);
+                                checkCount(0);
+                                require(state()->pinyin == beforePinyin &&
+                                            state()->generation == beforeGeneration,
+                                        "clear should not reset the current composition");
+                                // Keep typing the SAME composition, with no
+                                // reset/commit/focus cycle to restore history.
+                                type("ma");
+                                stage = 5;
+                            } else if (stage == 5 &&
+                                       !llmAddon->requestHistory().entries().empty() &&
+                                       llmAddon->requestHistory().entries().back().status == "usable") {
+                                checkCount(1);
+                                const auto &entry = llmAddon->requestHistory().entries().back();
+                                require(entry.content == "他们正在开会吗" && entry.started &&
+                                            entry.pinyin.ends_with("'ma"),
+                                        "continuing the original composition after clear stopped logging");
+                                checkStatistics(3, 3, 3);
+                                view->activate(ic);
+                                viewedSnapshot = llmAddon->historySnapshotPath();
+                                require(readTestData(viewedSnapshot).find("他们正在开会吗") !=
+                                            std::string::npos,
+                                        "reopening after clear and continued typing gave an empty page");
+                                stage = 6;
+                            } else if (stage == 6 && launches().size() == 4) {
+                                require(launches().back().at("path") == viewedSnapshot &&
+                                            launches().back().at("html").get<std::string>().find("他们正在开会吗") !=
+                                                std::string::npos,
+                                        "fourth explicit history launch did not see the continued-input row");
+                                clear->activate(ic);
+                                checkCount(0);
+                                ic->reset();
                                 finish(true, "");
                             }
                         } else if (scenario == "history-menu") {

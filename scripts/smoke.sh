@@ -122,7 +122,7 @@ run_checked config 'All config tests passed' "$RUN_DIR/config.log" "$BUILD_DIR/b
 run_checked worker 'All worker tests passed' "$RUN_DIR/worker.log" \
     "$BUILD_DIR/bin/testllmworker" "$BASE/v1/chat/completions"
 
-for scenario in mixed-contiguous-surrounding mixed-contiguous-surrounding-inflight mixed-contiguous-surrounding-visible mixed-context-changed mixed-contiguous-commit mixed-contiguous-commit-blocked live mixed mixed-badge-off english digits emoji emoji-tag debounce disabled dead preview reset partial toggle toggle-inflight sensitive sensitive-inflight context cache cooldown config filtered metadata original-pinyin original-shuangpin switch-inflight switch-results own-config virtual-keyboard preedit-click modifier-selection modifier-selection-global llm-alone private-settings customphrase-isolation learning-isolation learning-reload private-actions native-description cloud-badge badge-off llm-status stats-overlap stats-empty stats-error stats-invalid stats-all-filtered stats-limit stats-rate stats-focus history-menu history-disabled history-disable-live history-privacy history-stale history-native-blocked; do
+for scenario in history-clear-inflight history-clear-cycle mixed-contiguous-surrounding mixed-contiguous-surrounding-inflight mixed-contiguous-surrounding-visible mixed-context-changed mixed-contiguous-commit mixed-contiguous-commit-blocked live mixed mixed-badge-off english digits emoji emoji-tag debounce disabled dead preview reset partial toggle toggle-inflight sensitive sensitive-inflight context cache cooldown config filtered metadata original-pinyin original-shuangpin switch-inflight switch-results own-config virtual-keyboard preedit-click modifier-selection modifier-selection-global llm-alone private-settings customphrase-isolation learning-isolation learning-reload private-actions native-description cloud-badge badge-off llm-status stats-overlap stats-empty stats-error stats-invalid stats-all-filtered stats-limit stats-rate stats-focus history-menu history-disabled history-disable-live history-privacy history-stale history-native-blocked; do
     scenario_dir="$RUN_DIR/$scenario"
     mkdir -p "$scenario_dir"/{config/conf,data,cache,runtime}
     chmod 700 "$scenario_dir/runtime"
@@ -288,7 +288,7 @@ expected = {"mixed-contiguous-surrounding": 1,
              "stats-overlap": 1, "stats-empty": 1, "stats-error": 1,
              "stats-invalid": 1, "stats-all-filtered": 1, "stats-limit": 1,
              "stats-rate": 3, "stats-focus": 2,
-             "history-menu": 1, "history-disabled": 1,
+             "history-menu": 1, "history-clear-cycle": 3, "history-clear-inflight": 2, "history-disabled": 1,
              "history-disable-live": 1, "history-privacy": 2,
              "history-stale": 1, "history-native-blocked": 1}
 assert scenario in expected, f"missing request-count assertion for {scenario}"
@@ -314,7 +314,28 @@ if scenario.startswith("mixed-contiguous-") or scenario == "mixed-context-change
 import pathlib
 root = pathlib.Path(sys.argv[2]).parent
 opener_log = root / "opener.jsonl"
-if scenario in {"history-menu", "history-disable-live", "history-privacy"}:
+if scenario == "history-clear-inflight":
+    launches = [json.loads(line) for line in opener_log.read_text().splitlines()]
+    assert len(launches) == 2, "inflight clear probe must explicitly open/reopen history"
+    assert launches[0]["path"] == launches[1]["path"], "viewed snapshot should update in place after a new row"
+    assert "你好" in launches[1]["html"] and "她们正在开会" not in launches[1]["html"], "old reply resurrected or new history never appeared"
+    for launch in launches:
+        assert len(launch["args"]) == 1 and launch["file_mode"] == 0o600 and launch["directory_mode"] == 0o700
+        snapshot = pathlib.Path(launch["path"])
+        assert not snapshot.exists() and not snapshot.parent.exists(), "inflight clear retained a private snapshot"
+elif scenario == "history-clear-cycle":
+    launches = [json.loads(line) for line in opener_log.read_text().splitlines()]
+    assert len(launches) == 4, "clear/new-input cycle must reopen history four times"
+    assert len({launch["path"] for launch in launches}) == 4, "clear cycle reused a deleted snapshot URL"
+    assert "他们正在开会吗" in launches[3]["html"], "continued original composition lost its new history row"
+    assert "测试" in launches[1]["html"], "reopened page lost the new request/cache rows"
+    assert "她们正在开会" not in launches[1]["html"], "cleared rows resurrected in the second page"
+    assert "她们正在开会" in launches[2]["html"], "second clear prevented a fresh cached-input row"
+    for launch in launches:
+        assert len(launch["args"]) == 1 and launch["file_mode"] == 0o600 and launch["directory_mode"] == 0o700
+        snapshot = pathlib.Path(launch["path"])
+        assert not snapshot.exists() and not snapshot.parent.exists(), "clear cycle retained a snapshot"
+elif scenario in {"history-menu", "history-disable-live", "history-privacy"}:
     launches = [json.loads(line) for line in opener_log.read_text().splitlines()]
     assert len(launches) == 1, "history menu must launch only the explicit view once"
     launch = launches[0]
