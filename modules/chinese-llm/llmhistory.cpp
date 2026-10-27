@@ -171,22 +171,6 @@ void wipe(RequestHistoryEntry &entry) {
     std::vector<RejectedCandidate>().swap(entry.rejected);
 }
 
-std::string statusLabel(RequestStatus status) {
-    switch (status) {
-    case RequestStatus::Queued: return "排队 / Queued";
-    case RequestStatus::InFlight: return "请求中 / In flight";
-    case RequestStatus::CacheHit: return "缓存命中 / Cache hit";
-    case RequestStatus::Cancelled: return "已取消 / Cancelled";
-    case RequestStatus::Error: return "错误 / Error";
-    case RequestStatus::Empty: return "空响应 / Empty";
-    case RequestStatus::Filtered: return "全部被拒绝 / Filtered";
-    case RequestStatus::Completed: return "已完成 / Completed";
-    case RequestStatus::Usable: return "可用 / Usable";
-    case RequestStatus::Stale: return "已过期 / Stale";
-    }
-    return "";
-}
-
 bool validRuntimeDirectory(const char *path) {
     if (!path || path[0] != '/') {
         return false;
@@ -406,13 +390,113 @@ void RequestHistory::clear() {
     decltype(candidateIdentities_)().swap(candidateIdentities_);
 }
 
-std::string renderHistoryHtml(const RequestHistory &history, bool enabled) {
+namespace {
+
+/// One page is rendered in one language. `zh`/`en` are chosen at the call site
+/// so that every string is written next to its translation.
+struct Page {
+    bool chinese;
+    const char *operator()(const char *zh, const char *en) const {
+        return chinese ? zh : en;
+    }
+};
+
+std::string statusLabel(const Page &t, RequestStatus status) {
+    switch (status) {
+    case RequestStatus::Queued: return t("排队中", "Queued");
+    case RequestStatus::InFlight: return t("请求中", "In flight");
+    case RequestStatus::CacheHit: return t("缓存命中", "Cache hit");
+    case RequestStatus::Cancelled: return t("已取消", "Cancelled");
+    case RequestStatus::Error: return t("出错", "Error");
+    case RequestStatus::Empty: return t("空响应", "Empty");
+    case RequestStatus::Filtered: return t("全部被过滤", "Filtered");
+    case RequestStatus::Completed: return t("已完成", "Completed");
+    case RequestStatus::Usable: return t("可用", "Usable");
+    case RequestStatus::Stale: return t("已过期", "Stale");
+    }
+    return "";
+}
+
+/// Plain-language explanation of the machine-readable codes the addon records
+/// as cancel, error and rejection reasons. Unknown text is shown unchanged.
+std::string reasonLabel(const Page &t, const std::string &code) {
+    static const struct {
+        const char *code, *zh, *en;
+    } known[] = {
+        {"focus_lost", "输入框失去焦点", "Focus lost"},
+        {"composition_reset", "输入已重置", "Composition reset"},
+        {"input_method_changed", "已切换输入法", "Input method changed"},
+        {"input_method_deactivated", "输入法已停用", "Input method deactivated"},
+        {"capabilities_changed", "输入框能力变化", "Input capabilities changed"},
+        {"surrounding_context_changed", "上文发生变化", "Preceding text changed"},
+        {"input_not_eligible", "当前输入不适用", "Input not eligible"},
+        {"input_not_plain_pinyin", "不是纯拼音", "Not plain pinyin"},
+        {"input_keys_or_context_changed", "按键或上文已变化", "Keys or context changed"},
+        {"composition_invalidated", "输入已失效", "Composition invalidated"},
+        {"cancelled", "已取消", "Cancelled"},
+        {"response too large", "响应过大", "Response too large"},
+        {"incomplete completion response", "响应不完整", "Incomplete response"},
+        {"request processing failed", "请求处理失败", "Request processing failed"},
+        {"Reply no longer matches the current input", "回复与当前输入不一致",
+         "Reply no longer matches the current input"},
+        {"response_too_large", "响应过大", "Response too large"},
+        {"invalid_text", "文本无效", "Invalid text"},
+        {"empty_or_punctuation", "为空或只有标点", "Empty or punctuation only"},
+        {"markup", "含标记、列表或说明", "Markup, list or narration"},
+        {"too_long", "比拼音长得多", "Much longer than the pinyin"},
+        {"han_length_mismatch", "汉字数与拼音不符", "Han length does not match"},
+        {"key_echo", "只是回显了按键", "Merely echoes the keys"},
+    };
+    for (const auto &item : known) {
+        if (code == item.code) {
+            return t(item.zh, item.en);
+        }
+    }
+    if (code.rfind("http ", 0) == 0) {
+        return std::string(t("HTTP 状态 ", "HTTP status ")) + code.substr(5);
+    }
+    return code;
+}
+
+/// Label first; the original code stays available as a tooltip.
+std::string reasonHtml(const Page &t, const std::string &code) {
+    const auto label = reasonLabel(t, code);
+    if (label == code) {
+        return escapeHtml(code);
+    }
+    return "<span title=\"" + escapeHtml(code) + "\">" + escapeHtml(label) + "</span>";
+}
+
+} // namespace
+
+HistoryLanguage historyLanguageFromLocale(std::string_view locale) {
+    // The first entry of a LANGUAGE-style list is the preferred one.
+    locale = locale.substr(0, locale.find(':'));
+    if (locale.empty() || locale == "C" || locale == "POSIX" ||
+        locale.substr(0, 2) == "zh") {
+        return HistoryLanguage::Chinese;
+    }
+    return HistoryLanguage::English;
+}
+
+HistoryLanguage historyLanguageFromEnvironment() {
+    for (const char *name : {"LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"}) {
+        if (const char *value = std::getenv(name); value && *value) {
+            return historyLanguageFromLocale(value);
+        }
+    }
+    return HistoryLanguage::Chinese;
+}
+
+std::string renderHistoryHtml(const RequestHistory &history, bool enabled,
+                              HistoryLanguage language) {
+    const Page t{language == HistoryLanguage::Chinese};
     std::ostringstream html;
-    html << "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+    html << "<!doctype html><html lang=\"" << t("zh-CN", "en") << "\"><head><meta charset=\"utf-8\">"
          << "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; "
             "style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">"
          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-         << "<title>LLM 请求历史 / Request history</title><style>"
+         << "<title>" << t("LLM 请求历史", "LLM request history") << "</title><style>"
          << ":root{color-scheme:light dark;font-family:system-ui,sans-serif}"
             "body{margin:0;padding:24px;background:#f5f7fb;color:#202938}"
             "main{max-width:1500px;margin:auto}h1{font-size:1.6rem;margin:0 0 12px}"
@@ -428,71 +512,89 @@ std::string renderHistoryHtml(const RequestHistory &history, bool enabled) {
             "border-radius:6px;min-width:260px;font-size:.85rem}"
             "details{margin:8px 0}summary{cursor:pointer;font-weight:600}"
             "ol{padding-left:24px;max-height:20rem;overflow:auto}li{margin:7px 0}"
+            "span[title]{cursor:help;text-decoration:underline dotted}"
             ".error{color:#b42318}.empty{padding:24px;border:1px dashed #a9b7cb;"
             "border-radius:10px}@media(prefers-color-scheme:dark){body{background:#151a22;"
             "color:#e5edf7}.scroll{background:#202734;border-color:#445164}"
             "th{background:#303d50}tr:nth-child(even){background:#252e3c}"
             "th,td,pre{border-color:#445164}.note,small{color:#aab9cc}.error{color:#ffaaa3}}"
-         << "</style></head><body><main><h1>LLM 请求历史 / Request history</h1>"
-         << "<p class=\"state\">LLM："
-         << (enabled ? "已启用 / Enabled" : "已关闭 / Disabled")
+         << "</style></head><body><main><h1>" << t("LLM 请求历史", "LLM request history")
+         << "</h1><p class=\"state\">LLM："
+         << (enabled ? t("已启用", "Enabled") : t("已关闭", "Disabled"))
          << " · " << history.entries().size() << " / 100</p>"
-         << "<p class=\"note\">仅保留最近 100 次请求，不保存上下文或 API 密钥。"
-            "响应显示最多 8 KiB，候选与拒绝项各最多 32 条，每项显示最多 1024 字节；"
-            "截断以 … 标记。<br>Last 100 requests only; no context or API keys. "
-            "Response display: 8 KiB; accepted/rejected: 32 each; text display: "
-            "1024 bytes each. … indicates truncation.<br>此页面是只读本地快照，"
-            "刷新浏览器可查看已更新的快照。请使用输入法状态菜单“清空 LLM 请求历史”清空记录；"
-            "页面本身不能清空。关闭浏览器不会清空内存。<br>Read-only local snapshot; "
-            "refresh the browser to view updates. Use the input-method status menu "
-            "“Clear LLM request history” to clear records. This page cannot clear history; "
-            "closing the browser does not clear memory.</p>";
-    if (history.entries().empty()) {
-        html << "<p class=\"empty\">暂无请求历史 / No request history. "
-                "启用 LLM 后输入拼音可产生记录。 / Enable LLM and type pinyin to create records.</p>";
+         << "<p class=\"note\">";
+    if (t.chinese) {
+        html << "仅保留最近 100 次请求，不保存上下文或 API 密钥。"
+                "响应最多显示 8 KiB，候选与被拒绝项各最多 32 条，每项最多显示 1024 字节；"
+                "被截断处以 … 标记。<br>"
+                "此页面是只读的本地快照，刷新浏览器即可看到最新内容。"
+                "要清空记录，请使用输入法状态菜单中的“清空 LLM 请求历史”；"
+                "页面本身不能清空，关闭浏览器也不会清空内存中的记录。";
     } else {
-        html << "<div class=\"scroll\"><table><thead><tr>"
-                "<th>时间 / Time<br>ID · Seq</th><th>拼音 / Pinyin<br>模型 / Model</th>"
-                "<th>状态 / Status<br>请求已开始 / Started</th>"
-                "<th>耗时 / Elapsed<br>HTTP</th><th>原生重合 / Native overlap<br>采纳 / Adoption</th>"
-                "<th>响应与候选 / Response &amp; candidates</th></tr></thead><tbody>";
+        html << "Last 100 requests only; no context or API keys. Response display: "
+                "8 KiB; accepted/rejected: 32 each; text display: 1024 bytes each. "
+                "… marks truncation.<br>Read-only local snapshot; refresh the browser "
+                "to see updates. Use “Clear LLM request history” in the input-method "
+                "status menu to clear records. This page cannot clear history, and "
+                "closing the browser does not clear memory.";
+    }
+    html << "</p>";
+    if (history.entries().empty()) {
+        html << "<p class=\"empty\">"
+             << t("暂无请求历史。启用 LLM 后输入拼音即可产生记录。",
+                  "No request history yet. Enable LLM and type pinyin to create records.")
+             << "</p>";
+    } else {
+        html << "<div class=\"scroll\"><table><thead><tr><th>" << t("时间", "Time")
+             << "<br>ID · Seq</th><th>" << t("拼音", "Pinyin") << "<br>"
+             << t("模型", "Model") << "</th><th>" << t("状态", "Status") << "<br>"
+             << t("已发出请求", "Request sent") << "</th><th>" << t("耗时", "Elapsed")
+             << "<br>HTTP</th><th>" << t("与原生重合", "Native overlap") << "<br>"
+             << t("采纳", "Adoption") << "</th><th>"
+             << t("响应与候选", "Response &amp; candidates") << "</th></tr></thead><tbody>";
         for (auto iter = history.entries().rbegin(); iter != history.entries().rend(); ++iter) {
             const auto &entry = *iter;
             html << "<tr><td>" << entry.timestampMs << " ms<br><small>ID " << entry.id
                  << " · Seq " << entry.seq << "</small></td><td class=\"text\">"
                  << escapeHtml(entry.pinyin) << "<br><small>" << escapeHtml(entry.model)
-                 << "</small></td><td>" << statusLabel(entry.status) << "<br><small>"
-                 << (entry.started ? "是 / Yes" : "否 / No") << "</small>";
+                 << "</small></td><td>" << statusLabel(t, entry.status) << "<br><small>"
+                 << (entry.started ? t("是", "Yes") : t("否", "No")) << "</small>";
             if (!entry.error.empty()) {
-                html << "<p class=\"text error\">错误 / Error: " << escapeHtml(entry.error)
-                     << "</p>";
+                // Only a failed request is an error. A cancellation or stale
+                // reply is expected behaviour while typing, so it stays calm.
+                const bool failed = entry.status == RequestStatus::Error;
+                html << "<p class=\"text" << (failed ? " error" : "") << "\">"
+                     << (failed ? t("错误：", "Error: ") : t("原因：", "Reason: "))
+                     << reasonHtml(t, entry.error) << "</p>";
             }
             html << "</td><td>" << entry.elapsedMs << " ms<br>HTTP " << entry.httpStatus
                  << "</td><td>";
             if (!entry.overlap.has_value()) {
-                html << "未知 / Unknown";
+                html << t("未知", "Unknown");
             } else {
-                html << (*entry.overlap ? "是 / Yes" : "否 / No");
+                html << (*entry.overlap ? t("重合", "Overlaps") : t("不重合", "No overlap"));
             }
             html << "<br>";
             if (entry.adoption == "native") {
-                html << "原生候选采纳 / Native adoption";
+                html << t("采纳了原生候选", "Native candidate adopted");
             } else if (entry.adoption == "llm") {
-                html << "LLM 候选采纳 / LLM adoption";
+                html << t("采纳了 LLM 候选", "LLM candidate adopted");
             } else if (entry.adoption.empty()) {
-                html << "未采纳 / Not adopted";
+                html << t("未采纳", "Not adopted");
             } else {
                 html << escapeHtml(entry.adoption);
             }
             if (!entry.adoptedText.empty()) {
                 html << "<p class=\"text\">" << escapeHtml(entry.adoptedText) << "</p>";
             }
-            html << "</td><td><details><summary>原始 LLM / Raw LLM</summary><pre>"
-                 << (entry.content.empty() ? "（无响应） / No response" : escapeHtml(entry.content))
-                 << "</pre></details><details><summary>接受的候选 / Accepted ("
-                 << entry.candidates.size() << ")</summary>";
+            html << "</td><td><details><summary>" << t("模型原始回复", "Raw model reply")
+                 << "</summary><pre>"
+                 << (entry.content.empty() ? t("（无响应）", "(no response)")
+                                           : escapeHtml(entry.content))
+                 << "</pre></details><details><summary>" << t("接受的候选", "Accepted")
+                 << " (" << entry.candidates.size() << ")</summary>";
             if (entry.candidates.empty()) {
-                html << "<p>无 / None</p>";
+                html << "<p>" << t("无", "None") << "</p>";
             } else {
                 html << "<ol>";
                 for (const auto &candidate : entry.candidates) {
@@ -500,16 +602,16 @@ std::string renderHistoryHtml(const RequestHistory &history, bool enabled) {
                 }
                 html << "</ol>";
             }
-            html << "</details><details><summary>拒绝的候选与原因 / Rejected &amp; why ("
-                 << entry.rejected.size() << ")</summary>";
+            html << "</details><details><summary>" << t("被拒绝的候选", "Rejected")
+                 << " (" << entry.rejected.size() << ")</summary>";
             if (entry.rejected.empty()) {
-                html << "<p>无 / None</p>";
+                html << "<p>" << t("无", "None") << "</p>";
             } else {
                 html << "<ol>";
                 for (const auto &candidate : entry.rejected) {
                     html << "<li class=\"text\">" << escapeHtml(candidate.text)
-                         << "<br><small>原因 / Reason: " << escapeHtml(candidate.reason)
-                         << "</small></li>";
+                         << "<br><small>" << t("原因：", "Reason: ")
+                         << reasonHtml(t, candidate.reason) << "</small></li>";
                 }
                 html << "</ol>";
             }

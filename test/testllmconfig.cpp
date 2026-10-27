@@ -106,6 +106,9 @@ int main(int argc, char *argv[]) {
         {"MaxConsecutiveErrors", "Integer"},
         {"CooldownSeconds", "Integer"},
         {"ShowBadge", "Boolean"},
+        {"BadgeSymbol", "String"},
+        {"ShowOverlapBadge", "Boolean"},
+        {"OverlapSymbol", "String"},
         {"RecordHistory", "Boolean"},
         {"ToggleKey", "List|Key"},
         {"SystemPrompt", "String"},
@@ -130,6 +133,11 @@ int main(int argc, char *argv[]) {
         {"ShowBadge",
          {"Show cloud marker on LLM candidates",
           "在 LLM 候选词旁显示云朵标记"}},
+        {"BadgeSymbol", {"Symbol for LLM candidates", "LLM 候选词的标记符号"}},
+        {"ShowOverlapBadge",
+         {"Mark candidates the LLM agrees with", "标记与 LLM 一致的候选词"}},
+        {"OverlapSymbol",
+         {"Symbol for agreeing candidates", "与 LLM 一致的候选词的标记符号"}},
         {"RecordHistory", {"Record request history", "记录请求历史"}},
         {"ToggleKey", {"Toggle Key", "启用／停用快捷键"}},
         {"SystemPrompt", {"System Prompt", "系统提示词"}},
@@ -152,7 +160,7 @@ int main(int argc, char *argv[]) {
         {"PromptTemplate", "{context} 会替换为最近输入并确认的文本，{pinyin} "
                            "会替换为正在输入的拼音。"}};
     if (!root || root->subItemsSize() != expected.size()) {
-        std::cerr << "root GUI description does not expose 19 independent "
+        std::cerr << "root GUI description does not expose 22 independent "
                      "settings/link fields\n";
         return 1;
     }

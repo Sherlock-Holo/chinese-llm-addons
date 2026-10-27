@@ -16,3 +16,6 @@ Enabled=False
 2=chinese-llm-fullwidth
 3=chinese-llm-chttrans
 4=chinese-llm-pinyinhelper
+
+[Addon/OptionalDependencies]
+0=notifications

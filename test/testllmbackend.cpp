@@ -368,6 +368,26 @@ void testPredicates() {
 
 } // namespace
 
+void testBadgeSymbol() {
+    using E = BadgeSymbolError;
+    check(checkBadgeSymbol("\u2699\uFE0E") == E::None, "symbol with selector");
+    check(checkBadgeSymbol("\u2229") == E::None, "single symbol");
+    check(checkBadgeSymbol("\u2713\u2229\u2699\u2601") == E::None,
+          "four characters are allowed");
+    check(checkBadgeSymbol("") == E::Empty && checkBadgeSymbol("  ") == E::Empty,
+          "empty or blank is reported as empty");
+    check(checkBadgeSymbol("12345") == E::TooLong, "five characters are too long");
+    for (const char *bad : {"a:b", ":", "x\ny", "\x01", "\xff\xfe", " a", "a "}) {
+        check(checkBadgeSymbol(bad) == E::Unsafe,
+              std::string("unsafe symbol rejected: ") + bad);
+    }
+    // The constraint is what stops an invalid value from being loaded at all.
+    BadgeSymbolConstrain constrain;
+    check(constrain.check("\u2699") && !constrain.check("a:b") &&
+              !constrain.check(""),
+          "constraint agrees with the check");
+}
+
 int main() {
     testRenderPrompt();
     testBuildRequest();
@@ -378,6 +398,7 @@ int main() {
     testSanitizeNarration();
     testSanitizeUnsafe();
     testSanitizeDetailed();
+    testBadgeSymbol();
 
     if (failures != 0) {
         std::cerr << failures << " failure(s)\n";

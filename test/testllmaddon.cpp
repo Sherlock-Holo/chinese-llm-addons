@@ -1089,6 +1089,18 @@ int main(int argc, char **argv) {
                                                     std::string::npos,
                                                 "all-overlap native word was "
                                                 "marked as LLM");
+                                        // Agreement is shown on the native
+                                        // word, and only once.
+                                        require(word.comment().toString().ends_with(
+                                                    "\u2699\uFE0E"),
+                                                "overlapping native word has "
+                                                "no agreement mark");
+                                    } else {
+                                        require(word.comment().toString().find(
+                                                    "\u2699\uFE0E") ==
+                                                    std::string::npos,
+                                                "non-overlapping candidate "
+                                                "carries agreement mark");
                                     }
                                 }
                                 require(
@@ -1096,6 +1108,133 @@ int main(int argc, char **argv) {
                                     "all-overlap reply duplicated native word");
                                 ic->updateUserInterface(
                                     UserInterfaceComponent::InputPanel);
+                                {
+                                    int marks = 0;
+                                    for (int i = 0; i < bulk->totalSize(); ++i) {
+                                        const auto c = bulk->candidateFromAll(i)
+                                                           .comment()
+                                                           .toString();
+                                        for (auto at = c.find("\u2699\uFE0E");
+                                             at != std::string::npos;
+                                             at = c.find("\u2699\uFE0E", at + 1)) {
+                                            ++marks;
+                                        }
+                                    }
+                                    require(marks == 1,
+                                            "agreement mark was repeated by a "
+                                            "panel refresh");
+                                }
+                                {
+                                    // A new symbol replaces the old one on the
+                                    // next refresh; the two must not stack up.
+                                    // An invalid value is rejected, and an
+                                    // empty one restores the default.
+                                    RawConfig change;
+                                    llmAddon->getConfig()->save(change);
+                                    change.setValueByPath("OverlapSymbol",
+                                                          "\u2229");
+                                    llmAddon->setConfig(change);
+                                    ic->updateUserInterface(
+                                        UserInterfaceComponent::InputPanel);
+                                    for (int i = 0; i < bulk->totalSize(); ++i) {
+                                        const auto &word =
+                                            bulk->candidateFromAll(i);
+                                        require(word.comment().toString().find(
+                                                    "\u2699") ==
+                                                    std::string::npos,
+                                                "old symbol stayed after the "
+                                                "symbol was changed");
+                                        if (word.text().toString() == "你好") {
+                                            require(word.comment().toString() ==
+                                                        "\u2229",
+                                                    "new symbol was not shown "
+                                                    "exactly once");
+                                        }
+                                    }
+                                    // An invalid value is rejected: the
+                                    // previous symbol stays current and the
+                                    // bad text is never written to disk.
+                                    for (const char *bad :
+                                         {"bad:symbol", "12345", "a\nb"}) {
+                                        change.setValueByPath("OverlapSymbol",
+                                                              bad);
+                                        llmAddon->setConfig(change);
+                                        ic->updateUserInterface(
+                                            UserInterfaceComponent::InputPanel);
+                                        RawConfig now;
+                                        llmAddon->getConfig()->save(now);
+                                        require(*now.valueByPath(
+                                                    "OverlapSymbol") ==
+                                                    "\u2229",
+                                                "invalid symbol replaced the "
+                                                "previous one");
+                                        for (int i = 0; i < bulk->totalSize();
+                                             ++i) {
+                                            const auto &word =
+                                                bulk->candidateFromAll(i);
+                                            if (word.text().toString() ==
+                                                "你好") {
+                                                require(
+                                                    word.comment().toString() ==
+                                                        "\u2229",
+                                                    "invalid symbol changed "
+                                                    "the displayed mark");
+                                            }
+                                        }
+                                    }
+                                    {
+                                        // What reached the disk is what the
+                                        // next start will load.
+                                        const std::string saved = readTestData(
+                                            std::string(
+                                                std::getenv("XDG_CONFIG_HOME")) +
+                                            "/conf/chinese-llm.conf");
+                                        require(saved.find("OverlapSymbol=\u2229") !=
+                                                    std::string::npos &&
+                                                    saved.find("bad:symbol") ==
+                                                        std::string::npos &&
+                                                    saved.find("12345") ==
+                                                        std::string::npos,
+                                                "an invalid symbol was written "
+                                                "to the configuration file");
+                                    }
+                                    {
+                                        // Clearing the field restores the
+                                        // default, and what is stored is the
+                                        // default itself, so the settings page
+                                        // shows it filled in again.
+                                        change.setValueByPath("OverlapSymbol",
+                                                              "");
+                                        llmAddon->setConfig(change);
+                                        RawConfig now;
+                                        llmAddon->getConfig()->save(now);
+                                        require(*now.valueByPath(
+                                                    "OverlapSymbol") ==
+                                                    "\u2699\uFE0E",
+                                                "empty symbol did not restore "
+                                                "the default");
+                                        const std::string saved = readTestData(
+                                            std::string(
+                                                std::getenv("XDG_CONFIG_HOME")) +
+                                            "/conf/chinese-llm.conf");
+                                        require(saved.find("OverlapSymbol=\n") ==
+                                                    std::string::npos,
+                                                "an empty symbol was written "
+                                                "to the configuration file");
+                                    }
+                                }
+                                {
+                                    // Switching the option off removes the
+                                    // mark without resetting the composition.
+                                    RawConfig off;
+                                    llmAddon->getConfig()->save(off);
+                                    off.setValueByPath("ShowOverlapBadge", "False");
+                                    llmAddon->setConfig(off);
+                                    ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+                                    for (int i = 0; i < bulk->totalSize(); ++i) {
+                                        require(bulk->candidateFromAll(i).comment().toString().find("\u2699\uFE0E") == std::string::npos, "agreement mark remained after the option was switched off");
+                                    }
+                                }
                                 clickStatistics();
                                 checkStatistics(1, 1, 1);
                                 checkCommit("你好");

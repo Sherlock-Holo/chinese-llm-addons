@@ -8,6 +8,7 @@
 #include <deque>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -128,8 +129,15 @@ private:
     std::unordered_map<uint64_t, std::vector<std::string>> candidateIdentities_;
 };
 
+/// The page is written in one language, never both. Chinese is the default and
+/// is used unless the user's locale names another language.
+enum class HistoryLanguage { Chinese, English };
+HistoryLanguage historyLanguageFromLocale(std::string_view locale);
+HistoryLanguage historyLanguageFromEnvironment();
+
 // Standalone, read-only, script-free HTML. All input is treated as untrusted.
-std::string renderHistoryHtml(const RequestHistory &history, bool enabled);
+std::string renderHistoryHtml(const RequestHistory &history, bool enabled,
+                              HistoryLanguage language = HistoryLanguage::Chinese);
 
 // No filesystem work until an explicit write(). Each snapshot is a 0600 file
 // in a private 0700 directory. write() atomically replaces the old snapshot;

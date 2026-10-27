@@ -7,6 +7,7 @@
 #include "llmbackend.h"
 #include "llmworker.h"
 #include "native/pinyin/pinyin.h"
+#include "notifications_public.h"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -26,6 +27,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -43,7 +45,60 @@ constexpr char kEnvApiKey[] = "FCITX_CHINESE_LLM_API_KEY";
 /// Keep semantic text untouched for deduplication and commit, and request a
 /// monochrome cloud (U+2601 U+FE0E), not a colored emoji, in its display
 /// comment.
-constexpr char kBadge[] = "\u2601\uFE0E";
+constexpr char kDefaultBadge[] = "\u2601\uFE0E";
+/// Default for a dictionary candidate that the model also produced: the gear
+/// stands for "the machine agrees". A check mark was dropped because people type
+/// it as real text, and an intersection sign because it was too abstract. U+2699
+/// has an emoji presentation, so the text variation selector asks for the
+/// monochrome glyph, like the cloud. Both symbols are user-configurable.
+constexpr char kDefaultOverlapBadge[] = "\u2699\uFE0E";
+
+/// CandidateWord keeps setComment() protected because only a candidate should
+/// decide its own comment. The dictionary candidates belong to the private
+/// native engine, so the only way to annotate them in place (without
+/// re-implementing their selection logic) is to reach the member through a
+/// derived class, which is exactly what protected access allows.
+struct CandidateComment : fcitx::CandidateWord {
+    static void set(const fcitx::CandidateWord &word, fcitx::Text comment) {
+        auto &mutableWord = const_cast<fcitx::CandidateWord &>(word);
+        (mutableWord.*(&CandidateComment::setComment))(std::move(comment));
+    }
+};
+
+bool endsWith(const std::string &text, std::string_view suffix) {
+    return text.size() >= suffix.size() &&
+           text.compare(text.size() - suffix.size(), suffix.size(), suffix) ==
+               0;
+}
+
+/// Add the overlap mark after any comment the dictionary candidate already has.
+/// Returns whether anything changed, so repeated panel refreshes are no-ops.
+bool markOverlap(const fcitx::CandidateWord &word, const std::string &symbol) {
+    auto comment = word.comment().toString();
+    if (endsWith(comment, symbol)) {
+        return false;
+    }
+    if (!comment.empty()) {
+        comment += ' ';
+    }
+    comment += symbol;
+    CandidateComment::set(word, fcitx::Text(comment));
+    return true;
+}
+
+bool unmarkOverlap(const fcitx::CandidateWord &word,
+                   const std::string &symbol) {
+    auto comment = word.comment().toString();
+    if (symbol.empty() || !endsWith(comment, symbol)) {
+        return false;
+    }
+    comment.resize(comment.size() - symbol.size());
+    if (endsWith(comment, " ")) {
+        comment.pop_back();
+    }
+    CandidateComment::set(word, fcitx::Text(comment));
+    return true;
+}
 /// Quiet period before an opened history snapshot is rewritten.
 constexpr uint64_t kSnapshotDelayUs = 300 * 1000;
 
@@ -59,15 +114,14 @@ constexpr uint64_t kSnapshotDelayUs = 300 * 1000;
  */
 class LlmCandidateWord : public fcitx::CandidateWord {
 public:
-    LlmCandidateWord(std::string text, bool badge,
+    LlmCandidateWord(std::string text, const std::string &badge,
                      std::function<bool(fcitx::InputContext *)> valid,
                      std::function<void()> adopted)
         : text_(std::move(text)), valid_(std::move(valid)),
           adopted_(std::move(adopted)) {
         setText(fcitx::Text(text_));
-        if (badge) {
-            fcitx::Text comment(kBadge);
-            setComment(comment);
+        if (!badge.empty()) {
+            setComment(fcitx::Text(badge));
             setSpaceBetweenComment(true);
         }
     }
@@ -367,14 +421,75 @@ void ChineseLlm::reloadConfig() {
     refreshStatus();
 }
 
-void ChineseLlm::setConfig(const fcitx::RawConfig &config) {
+void ChineseLlm::notifyUser(const std::string &tipId,
+                            const std::string &summary,
+                            const std::string &body) {
+    if (auto *notifications = this->notifications()) {
+        notifications->call<fcitx::INotifications::showTip>(
+            tipId, _("LLM Pinyin"), "", summary, body, 5000);
+    }
+}
+
+void ChineseLlm::rejectInvalidSymbols(fcitx::RawConfig &config) {
+    struct Field {
+        const char *path;
+        const char *label;
+        const char *defaultSymbol;
+    };
+    for (const auto &[path, label, defaultSymbol] :
+         {Field{"BadgeSymbol", D_("chinese-llm", "Symbol for LLM candidates"),
+                kDefaultBadge},
+          Field{"OverlapSymbol",
+                D_("chinese-llm", "Symbol for agreeing candidates"),
+                kDefaultOverlapBadge}}) {
+        const auto *value = config.valueByPath(path);
+        if (!value) {
+            continue;
+        }
+        const char *reason = nullptr;
+        switch (checkBadgeSymbol(*value)) {
+        case BadgeSymbolError::None:
+            continue;
+        case BadgeSymbolError::Empty:
+            // Clearing the field means "restore the default". It is stored as
+            // the default, so the settings page shows it filled in again.
+            config.setValueByPath(path, defaultSymbol);
+            continue;
+        case BadgeSymbolError::TooLong:
+            reason = _("The symbol may have at most four characters.");
+            break;
+        case BadgeSymbolError::Unsafe:
+            reason = _("The symbol must not contain a colon, a control "
+                       "character, invalid text or blanks at either end.");
+            break;
+        }
+        // Missing from the incoming configuration means "unchanged" for a
+        // partial load, so the previous symbol is kept rather than reset.
+        config.remove(path);
+        FCITX_WARN() << "chinese-llm: rejected invalid " << path;
+        const std::string field = _(label);
+        notifyUser("chinese-llm-invalid-symbol",
+                   std::vformat(_("{0} was not saved"),
+                                std::make_format_args(field)),
+                   reason);
+    }
+}
+
+void ChineseLlm::setConfig(const fcitx::RawConfig &incoming) {
+    RawConfig config = incoming;
+    rejectInvalidSymbols(config);
     RawConfig before;
     config_.save(before);
     config_.load(config, true);
     RawConfig after;
     config_.save(after);
-    before.remove("RecordHistory");
-    after.remove("RecordHistory");
+    // Neither switch changes what is requested, so they must not reset the
+    // composition. The overlap mark follows the next panel refresh.
+    for (const char *name :
+         {"RecordHistory", "ShowOverlapBadge", "OverlapSymbol"}) {
+        before.remove(name);
+        after.remove(name);
+    }
     fcitx::safeSaveAsIni(config_, "conf/chinese-llm.conf");
     if (!config_.recordHistory.value()) {
         clearHistory();
@@ -529,9 +644,12 @@ void ChineseLlm::removeCandidates(fcitx::InputContext *ic, LlmState *state) {
     }
     bool removed = false;
     for (int i = modifiable->totalSize() - 1; i >= 0; --i) {
-        if (dynamic_cast<const LlmCandidateWord *>(
-                &modifiable->candidateFromAll(i))) {
+        const auto &word = modifiable->candidateFromAll(i);
+        if (dynamic_cast<const LlmCandidateWord *>(&word)) {
             modifiable->remove(i);
+            removed = true;
+        } else if (unmarkOverlap(word, appliedOverlapSymbol_)) {
+            // The model no longer vouches for this candidate.
             removed = true;
         }
     }
@@ -805,7 +923,42 @@ void ChineseLlm::insertCandidates(fcitx::InputContext *ic, LlmState *state,
     }
     const int wanted =
         std::min<int>(candidates.size(), config_.maxCandidates.value());
-    const bool badge = config_.showBadge.value();
+    const std::string badge =
+        config_.showBadge.value() ? config_.badgeSymbol.value() : std::string();
+
+    // Tell the user where the dictionary and the model agree. This happens
+    // before the early returns below: an all-overlap reply inserts nothing, and
+    // that is precisely when the mark is the only visible sign of the model.
+    // Switching the option off also takes the marks back on the next refresh.
+    {
+        const bool wanted = config_.showOverlapBadge.value();
+        const std::string symbol = config_.overlapSymbol.value();
+        bool changed = false;
+        for (int i = 0; i < total; ++i) {
+            const auto &word = modifiable->candidateFromAll(i);
+            if (dynamic_cast<const LlmCandidateWord *>(&word)) {
+                continue;
+            }
+            const bool agrees =
+                wanted &&
+                std::ranges::find(candidates, word.text().toString()) !=
+                    candidates.end();
+            // A symbol that was changed in the settings is taken back before
+            // the new one is written, so two marks never stack up.
+            if (!agrees || appliedOverlapSymbol_ != symbol) {
+                changed |= unmarkOverlap(word, appliedOverlapSymbol_);
+            }
+            if (agrees) {
+                changed |= markOverlap(word, symbol);
+            }
+        }
+        appliedOverlapSymbol_ = symbol;
+        if (changed) {
+            state->inserting = true;
+            ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+            state->inserting = false;
+        }
+    }
 
     // Collect what is already on screen so a model reading that duplicates a
     // dictionary reading does not appear twice.
@@ -943,7 +1096,8 @@ void ChineseLlm::clearHistory() {
 bool ChineseLlm::writeHistorySnapshot() {
     historySnapshotDirty_ = false;
     return historySnapshot_.write(
-        renderHistoryHtml(history_, config_.recordHistory.value()));
+        renderHistoryHtml(history_, config_.recordHistory.value(),
+                          historyLanguageFromEnvironment()));
 }
 
 void ChineseLlm::scheduleHistorySnapshot() {

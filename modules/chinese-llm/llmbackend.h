@@ -7,6 +7,7 @@
 #define _CHINESE_LLM_LLMBACKEND_H_
 
 #include <cstddef>
+#include <fcitx-config/rawconfig.h>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -114,6 +115,31 @@ bool isAllHan(std::string_view text);
 /// been selected yet, and this predicate is how that is decided: it is the one
 /// property we can check exactly through the public API.
 bool isPlainPinyin(std::string_view text);
+
+/// Why a user-chosen marker symbol cannot be used.
+enum class BadgeSymbolError {
+    None,
+    /// Empty, or nothing but blanks.
+    Empty,
+    /// More than four characters.
+    TooLong,
+    /// Invalid UTF-8, a control character, ':' (the Kimpanel property
+    /// delimiter) or a blank at either end. The symbol goes straight into the
+    /// candidate bar, so it must never be able to break the panel protocol.
+    Unsafe,
+};
+
+BadgeSymbolError checkBadgeSymbol(std::string_view symbol);
+
+/// Option constraint built on checkBadgeSymbol(). Fcitx applies it whenever a
+/// value is loaded, so an invalid value can never become the current one.
+struct BadgeSymbolConstrain {
+    using Type = std::string;
+    bool check(const std::string &value) const {
+        return checkBadgeSymbol(value) == BadgeSymbolError::None;
+    }
+    void dumpDescription(RawConfig & /*unused*/) const {}
+};
 
 } // namespace fcitx::chinesellm
 

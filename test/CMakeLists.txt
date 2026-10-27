@@ -33,7 +33,7 @@ target_include_directories(testllmhistory PRIVATE ${PROJECT_SOURCE_DIR}/modules/
 target_link_libraries(testllmhistory Fcitx5::Core PkgConfig::Curl)
 add_test(NAME testllmhistory COMMAND testllmhistory)
 
-add_executable(testllmconfig testllmconfig.cpp)
+add_executable(testllmconfig testllmconfig.cpp ../modules/chinese-llm/llmbackend.cpp)
 target_include_directories(testllmconfig PRIVATE ${PROJECT_SOURCE_DIR}/modules/chinese-llm)
 target_link_libraries(testllmconfig Fcitx5::Core Fcitx5::Config PkgConfig::Curl nlohmann_json::nlohmann_json)
 add_dependencies(testllmconfig chinese-llm-translation)

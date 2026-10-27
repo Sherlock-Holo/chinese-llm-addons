@@ -168,6 +168,42 @@ without needing an extension patch. The cloud is not committed, cached as model
 text or learned. Its exact appearance depends on the panel font. Turning the
 marker off removes it without disabling LLM requests.
 
+With `ShowOverlapBadge=True` (default), a **dictionary** candidate that the model
+also produced gets a small monochrome gear (`你好 ⚙︎`). The two marks answer
+different questions: the cloud says "this text exists only because of the model",
+the gear says "the machine independently agrees with this dictionary candidate".
+A check mark was tried first and dropped because people type it as real text, so
+it read as a candidate; the intersection sign was dropped as too abstract. U+2699
+has an emoji presentation, so the text variation selector (U+FE0E) requests the
+monochrome glyph. Panels such as Kimpanel flatten a candidate's comment into plain
+text, so the size cannot be changed; only the glyph and the font decide it.
+When every model candidate duplicates a dictionary one, nothing is inserted, so
+the mark is the only visible sign that the model answered. The mark is
+display-only: it is not committed, not part of the text compared for statistics
+and not learned. Turning the option off removes it on the next panel refresh and
+does not reset your composition or affect statistics.
+
+Both symbols are settings, so you can try others without rebuilding:
+`BadgeSymbol` (default `☁︎`) for model candidates and `OverlapSymbol` (default `⚙︎`)
+for agreeing dictionary candidates. **Clear the field and save to restore that
+symbol's default**; the settings page then shows the default filled in again, and no
+other setting is touched (unlike the page-wide "restore defaults"). Otherwise a value
+must be valid UTF-8, at most four characters, with no control character, no `:` (the
+Kimpanel property delimiter) and no blank at either end. An invalid value is
+**rejected, not saved**: the previous symbol stays current, the configuration file
+is not changed, and a desktop notification (when the notifications addon is
+available) says which setting was refused and why. A value read from a hand-edited
+file at startup that is invalid falls back to the default. The text is used exactly as
+typed: nothing is appended, so a symbol with an emoji form is drawn in whichever
+style the font picks unless you add U+FE0E (monochrome) or U+FE0F (colour) yourself.
+Note that a symbol typed or pasted without U+FE0E can fall back to a font whose
+line is much taller than Han text and stretch the candidate row (observed with a
+bare U+2699 in Kimpanel: the default `⚙︎`, which carries U+FE0E, did not). If that
+happens, clear the field to restore the default, add U+FE0E yourself, or pick
+another symbol. A changed overlap symbol replaces the old one on the next panel refresh and
+does not reset the composition. `BadgeSymbol` applies to candidates created
+afterwards.
+
 `CandidateIndex=1` inserts model suggestions in the first slot **after a result
 arrives**. A first dictionary candidate is not evidence of model output. Results
 identical to existing dictionary candidates are deduplicated; the dictionary
@@ -266,6 +302,13 @@ indicate omitted data. Original candidate identities for exact adoption matching
 are separately bounded to 64 KiB per row. Old entries are evicted automatically;
 cleared or evicted entries cannot reappear from late callbacks.
 
+The history page is written in one language, never both. It is Chinese unless the
+locale (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`, in that order) names a
+non-Chinese language, in which case it is English. Machine-readable reasons such as
+`input_keys_or_context_changed` are shown as a plain description with the original
+code as a tooltip. Only a failed request is drawn in red; a cancellation or stale
+reply is shown as a neutral reason.
+
 By default no history file exists. Explicit viewing creates a snapshot in a private
 0700 temporary directory with a 0600 file (XDG runtime directory, or a private
 system-temp fallback). After opening, new records/commits update that snapshot;
@@ -317,7 +360,7 @@ connection-test button, automatic model listing or model-service startup yet.
 - `Enabled=True`: model suggestions switch, separate from addon enablement.
 - `Endpoint`, `Model`, `ApiKey`: compatible API settings.
 - `MinPinyinLength=4`, `DebounceMs=250`, `TimeoutSeconds=5`.
-- `MaxCandidates=3`, `CandidateIndex=2` (1-based), `ShowBadge=True`.
+- `MaxCandidates=3`, `CandidateIndex=2` (1-based), `ShowBadge=True`, `ShowOverlapBadge=True`, `BadgeSymbol=☁︎`, `OverlapSymbol=⚙︎`.
 - `ContextLength=64` (0 disables surrounding-text use), `CacheSize=256`.
 - `MaxConsecutiveErrors=5`, `CooldownSeconds=120`.
 - `ToggleKey=Control+Alt+Shift+L`: only intercepted in LLM拼音.

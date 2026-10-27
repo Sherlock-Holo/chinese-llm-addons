@@ -218,7 +218,7 @@ void safetyAndLimitTests() {
 
 void rendererTests() {
     RequestHistory history;
-    auto html = renderHistoryHtml(history, false);
+    auto html = renderHistoryHtml(history, false, HistoryLanguage::English);
     check(contains(html, "No request history") && contains(html, "Disabled"),
           "empty history explains itself");
     check(contains(html, "default-src 'none'") && !contains(html, "<script") &&
@@ -235,15 +235,46 @@ void rendererTests() {
     history.finish(second, result);
     history.markUsable(second, true);
     history.adopt(second, attack, false);
-    html = renderHistoryHtml(history, true);
+    html = renderHistoryHtml(history, true, HistoryLanguage::English);
     check(html.find("new-pinyin") < html.find("old-pinyin"), "newest request first");
     check(contains(html, "Usable") && contains(html, "Seq 77") &&
-              contains(html, "HTTP 200") && contains(html, "LLM adoption") &&
-              contains(html, "Rejected &amp; why (1)"),
+              contains(html, "HTTP 200") && contains(html, "LLM candidate adopted") &&
+              contains(html, "Rejected (1)"),
           "page shows status, timing, adoption and rejections");
     check(contains(html, "&lt;script&gt;") && contains(html, "&quot;&amp;") &&
               !contains(html, "<script>") && !contains(html, "<img"),
           "every untrusted field is HTML-escaped");
+
+    // One language per page: Chinese by default, never both at once.
+    RequestHistory sample;
+    const auto cancelled = sample.begin("ni'hao", "m");
+    sample.markCancelled(cancelled, "input_keys_or_context_changed");
+    const auto chinese = renderHistoryHtml(sample, true);
+    check(contains(chinese, "已取消") && contains(chinese, "按键或上文已变化") &&
+              contains(chinese, "title=\"input_keys_or_context_changed\"") &&
+              !contains(chinese, "Cancelled") && !contains(chinese, "Pinyin") &&
+              !contains(chinese, " / Request"),
+          "default page is Chinese only, with the raw code kept as a tooltip");
+    check(!contains(chinese, "class=\"text error\""),
+          "a cancellation is not displayed as an error");
+    const auto english = renderHistoryHtml(sample, true, HistoryLanguage::English);
+    check(contains(english, "Cancelled") && contains(english, "Keys or context changed") &&
+              !contains(english, "已取消"),
+          "English page contains no Chinese labels");
+    check(historyLanguageFromLocale("zh_CN.UTF-8") == HistoryLanguage::Chinese &&
+              historyLanguageFromLocale("zh_TW:en_US") == HistoryLanguage::Chinese &&
+              historyLanguageFromLocale("C") == HistoryLanguage::Chinese &&
+              historyLanguageFromLocale("en_US.UTF-8") == HistoryLanguage::English &&
+              historyLanguageFromLocale("de_DE.UTF-8") == HistoryLanguage::English,
+          "locale picks the page language, Chinese first");
+    RequestHistory failed;
+    const auto failedId = failed.begin("x", "m");
+    auto failure = successful();
+    failure.ok = false;
+    failure.error = "http 500";
+    failed.finish(failedId, failure);
+    check(contains(renderHistoryHtml(failed, true), "class=\"text error\""),
+          "a real failure is still displayed as an error");
 }
 
 std::string readSnapshot(const std::string &path) {

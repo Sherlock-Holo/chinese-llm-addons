@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 #include "llmbackend.h"
+#include <algorithm>
 #include <cstdint>
 #include <fcitx-utils/utf8.h>
 #include <iterator>
@@ -733,6 +734,27 @@ std::vector<std::string> sanitize(std::string_view content,
                                   std::string_view pinyin,
                                   size_t maxCandidates) {
     return sanitizeDetailed(content, pinyin, maxCandidates).candidates;
+}
+
+BadgeSymbolError checkBadgeSymbol(std::string_view symbol) {
+    constexpr size_t MaxBadgeCharacters = 4;
+    const auto blank = [](char ch) { return ch == ' ' || ch == '\t'; };
+    if (symbol.empty() || std::ranges::all_of(symbol, blank)) {
+        return BadgeSymbolError::Empty;
+    }
+    if (!fcitx::utf8::validate(symbol) || blank(symbol.front()) ||
+        blank(symbol.back())) {
+        return BadgeSymbolError::Unsafe;
+    }
+    for (const unsigned char ch : symbol) {
+        if (ch < 0x20 || ch == 0x7f || ch == ':') {
+            return BadgeSymbolError::Unsafe;
+        }
+    }
+    if (fcitx::utf8::length(symbol) > MaxBadgeCharacters) {
+        return BadgeSymbolError::TooLong;
+    }
+    return BadgeSymbolError::None;
 }
 
 } // namespace fcitx::chinesellm
