@@ -186,6 +186,49 @@ This is the **configured switch state**, not a server-health or request-progress
 indicator. Short compositions, sensitive fields, failed requests, cooldown and
 candidate deduplication may leave only native candidates even with `AI` enabled.
 
+### Session request and overlap statistics
+
+The LLM拼音 status menu also shows three read-only statistics, translated into
+Chinese: **LLM requests N (valid V)**, **LLM overlapping requests O**, and
+**LLM overlap rate R**. Numbers appear directly in each item's visible short
+text because GNOME Kimpanel may not render tooltips. With no valid requests,
+`R` is `—`, not `0%`; otherwise it is a percentage with one decimal place, such
+as `33.3%`. The tooltips explain the counting rules below.
+
+This is a **per-request any-match rate**, not a candidate-level percentage,
+first-candidate agreement rate, model accuracy score or server-health indicator:
+
+- **Requests (`sent`, N):** one logical transfer attempt is counted immediately
+  before calling `curl_easy_perform`. HTTP redirects still count as just one
+  attempt. A transfer that later fails or is cancelled remains counted; this is
+  not proof that the server received a request. Cache hits and requests cancelled
+  while still queued, before a transfer starts, do not increment the count.
+- **Valid requests (`compared`, V):** a result is counted only when accepted on
+  the main thread after the current sequence, generation, privacy, composition
+  and surrounding-context guards pass, and when `ok` is true and its validated
+  candidate list is nonempty. Errors, empty responses, results whose candidates
+  are all filtered out, stale results and cancelled results do not enter this
+  denominator. A successful HTTP response alone is not a valid request.
+- **Overlapping requests (`overlapping`, O):** compare all validated model
+  candidates with the **entire native modifiable candidate list**, using exact
+  raw UTF-8 text equality. The comparison excludes additional LLM candidates;
+  display comments, including the cloud marker, are not part of the text. Any
+  model candidate matching any native candidate counts that valid request once,
+  no matter how many candidates match. Mixed results with both native matches
+  and novel candidates still count as overlapping, even when a cloud-marked
+  novel candidate remains visible. Comparison happens before the model candidate
+  display limit, so `MaxCandidates`, `ShowBadge` and `CandidateIndex` do not change
+  the statistics.
+- **Overlap rate (`R`):** `100 * overlapping / compared`. For example, one
+  overlapping request among three valid requests gives `33.3%`, regardless of
+  the total number of candidates those requests returned.
+
+These counters belong to the current addon/Fcitx lifetime, not an individual
+input field or model configuration. Configuration reloads, LLM toggles and input
+method switches preserve them; restarting Fcitx resets them to zero. Statistics
+persist neither input content nor counters to disk. This does not change the
+separate native learning/history or in-memory LLM candidate-cache behavior.
+
 ## OpenAI-compatible endpoint
 
 `Endpoint` is the **complete Chat Completions URL**, not just a base URL or `/v1`.

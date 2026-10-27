@@ -135,6 +135,15 @@ class Handler(BaseHTTPRequestHandler):
         finish_reason = "stop"
         if path.startswith("/empty/"):
             content = ""
+        elif path.startswith("/all-filtered/"):
+            # Valid completion envelope, but no candidate survives sanitizing:
+            # Latin output, incorrect Han length and punctuation-only content.
+            content = "not a Chinese candidate\n测试\n。。。"
+        elif path.startswith("/late-overlap/"):
+            # With MaxCandidates=1 only the first novel reading is displayed.
+            # The later native reading must still make this request overlap;
+            # trailing punctuation is sanitized before exact comparison.
+            content = "她们正在开会\n他们正在开会。\n它们正在开会"
         elif path.startswith("/truncated/"):
             content = "你好"
             finish_reason = "length"

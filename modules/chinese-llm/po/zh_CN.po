@@ -75,6 +75,27 @@ msgstr "LLM 候选词已停用"
 msgid "Click or use the toggle shortcut to enable or disable LLM candidates. Native pinyin remains available when disabled."
 msgstr "点击此项或使用启用／停用快捷键切换 LLM 候选词。停用后仍可使用原生拼音。"
 
+#, c++-format
+msgid "LLM requests {0} (valid {1})"
+msgstr "LLM 请求 {0}（有效 {1}）"
+
+#, c++-format
+msgid "LLM overlapping requests {0}"
+msgstr "LLM 重叠请求 {0}"
+
+#, c++-format
+msgid "LLM overlap rate {0}"
+msgstr "LLM 重叠率 {0}"
+
+msgid "Requests started in this Fcitx session, including failures and cancellations. Valid requests returned usable candidates for the current input. Cache hits are not requests."
+msgstr "本次 Fcitx 运行发起的请求，包括失败和取消。有效请求指返回可用候选且仍对应当前输入的请求。缓存命中不算请求。"
+
+msgid "Valid requests with at least one candidate identical to any native candidate. Each request is counted once, before applying the candidate display limit."
+msgstr "有效请求中至少一个候选与任意原生候选完全相同的请求数。每个请求只计一次，不受候选显示数量限制。"
+
+msgid "Overlapping requests divided by valid requests. No rate is shown until a valid request completes. Statistics reset when Fcitx restarts; no input text is saved."
+msgstr "重叠请求数除以有效请求数。没有有效请求时不显示比例。重启 Fcitx 后统计清零，不保存输入文本。"
+
 msgid "Toggle Key"
 msgstr "启用／停用快捷键"
 

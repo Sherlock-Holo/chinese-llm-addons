@@ -2,7 +2,7 @@
 # Run makepkg from this checkout, or set CHINESE_LLM_SOURCE_DIR to it.
 # prepare() includes uncommitted source files in a fresh, isolated snapshot.
 pkgname=chinese-llm-addons
-pkgver=5.1.15.local.h83c59f208b00cf81
+pkgver=5.1.15.local.haff9c02352c347db
 pkgrel=1
 pkgdesc='Independent LLM Pinyin input method for Fcitx5 (keeps official Chinese addons)'
 arch=('x86_64')

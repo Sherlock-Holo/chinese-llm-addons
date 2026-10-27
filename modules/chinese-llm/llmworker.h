@@ -57,8 +57,19 @@ public:
     ///
     /// The sequence number identifies the newest request; a response whose
     /// sequence is older than the newest one is dropped by the caller.
+    /// started runs on the worker thread when a logical transfer is attempted,
+    /// even if its reply is later cancelled or superseded. Marshal UI work to
+    /// the main thread; neither callback may throw.
     uint64_t submit(BackendConfig config, std::string pinyin,
-                    std::string context, FetchCallback callback);
+                    std::string context, FetchCallback callback,
+                    std::function<void()> started = {});
+
+    /// Logical network attempts, not queued jobs or redirect hops. Includes
+    /// failed/cancelled transfers; starting curl does not prove server receipt.
+    /// Kept for this worker's lifetime, including stop/start and cancelAll().
+    uint64_t requestsStarted() const {
+        return requestsStarted_.load(std::memory_order_relaxed);
+    }
 
     /// Invalidate every queued and in-flight request. Called when the config
     /// changes or the addon is toggled, so stale replies cannot land.
@@ -74,6 +85,7 @@ private:
         std::string pinyin;
         std::string context;
         FetchCallback callback;
+        std::function<void()> started;
     };
 
     void run();
@@ -93,6 +105,7 @@ private:
     std::thread thread_;
     std::atomic<bool> stop_{false};
     std::atomic<uint64_t> seq_{0};
+    std::atomic<uint64_t> requestsStarted_{0};
 
     std::mutex mutex_;
     std::condition_variable cv_;

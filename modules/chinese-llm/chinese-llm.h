@@ -153,6 +153,15 @@ struct LlmState : public fcitx::InputContextProperty {
     uint64_t generation = 0;
 };
 
+/// Session-only aggregates. A comparable request is a current, accepted network
+/// reply with at least one usable candidate. Overlap is any exact native match,
+/// counted once per request, not once per word. No input content is retained.
+struct RequestStatistics {
+    uint64_t sent = 0;
+    uint64_t compared = 0;
+    uint64_t overlapping = 0;
+};
+
 // A separate input method with a privately compiled native pinyin engine.
 // Both native settings/learning and LLM configuration belong to this addon.
 class ChineseLlm : public fcitx::InputMethodEngineV4,
@@ -197,6 +206,11 @@ public:
     LlmState *stateFor(fcitx::InputContext *ic) {
         return ic->propertyFor(&factory_);
     }
+    /// Main-thread snapshot; sent includes failed/cancelled network attempts.
+    RequestStatistics requestStatistics() const {
+        return {worker_->requestsStarted(), comparedRequests_,
+                overlappingRequests_};
+    }
 
 private:
     void handleUpdateUI(fcitx::Event &event);
@@ -226,6 +240,9 @@ private:
                           const std::vector<std::string> &candidates);
     void toggle();
     void refreshStatus();
+    void refreshStatistics();
+    void compareNativeCandidates(fcitx::InputContext *ic,
+                                 const std::vector<std::string> &candidates);
 
     void noteError(const std::string &error);
     bool inCooldown() const;
@@ -248,7 +265,13 @@ private:
         [](fcitx::InputContext &) { return new LlmState; }};
     ChineseLlmConfig config_;
     fcitx::SimpleAction toggleAction_;
+    // Read-only menu rows. No activation callbacks or configuration bindings.
+    fcitx::SimpleAction requestsAction_;
+    fcitx::SimpleAction overlapAction_;
+    fcitx::SimpleAction rateAction_;
     fcitx::ScopedConnection toggleConnection_;
+    uint64_t comparedRequests_ = 0;
+    uint64_t overlappingRequests_ = 0;
     std::vector<std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>>
         eventWatchers_;
 

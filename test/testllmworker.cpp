@@ -54,18 +54,43 @@ std::string origin(const std::string &endpoint) {
 // polling a plain bool, this establishes a happens-before edge for the result.
 std::optional<FetchResult> request(LlmWorker &worker, BackendConfig config,
                                    const std::string &pinyin = "nihao",
-                                   const std::string &context = "") {
+                                   const std::string &context = "",
+                                   bool expectedStarted = true) {
     auto promise = std::make_shared<std::promise<FetchResult>>();
     auto future = promise->get_future();
-    const auto seq = worker.submit(std::move(config), pinyin, context,
-                                   [promise](FetchResult result) {
-                                       promise->set_value(std::move(result));
-                                   });
+    auto startedCalls = std::make_shared<std::atomic<int>>(0);
+    auto startedOnWorker = std::make_shared<std::atomic<bool>>(false);
+    auto repliedOnWorker = std::make_shared<std::atomic<bool>>(false);
+    auto countedBeforeNotification = std::make_shared<std::atomic<bool>>(false);
+    const auto callerThread = std::this_thread::get_id();
+    const auto before = worker.requestsStarted();
+    const auto seq = worker.submit(
+        std::move(config), pinyin, context,
+        [promise, repliedOnWorker, callerThread](FetchResult result) {
+            *repliedOnWorker = std::this_thread::get_id() != callerThread;
+            promise->set_value(std::move(result));
+        },
+        [&worker, startedCalls, startedOnWorker, countedBeforeNotification,
+         callerThread, before] {
+            ++*startedCalls;
+            *startedOnWorker = std::this_thread::get_id() != callerThread;
+            *countedBeforeNotification = worker.requestsStarted() == before + 1;
+        });
     if (future.wait_for(6s) != std::future_status::ready) {
         check(false, "no reply for " + pinyin + " within 6s");
         return std::nullopt;
     }
     auto result = future.get();
+    check(worker.requestsStarted() == before + (expectedStarted ? 1 : 0),
+          "requestsStarted counts actual transfers, not submitted jobs");
+    check(*startedCalls == (expectedStarted ? 1 : 0),
+          "started callback runs exactly once per actual transfer");
+    if (expectedStarted) {
+        check(*startedOnWorker && *repliedOnWorker &&
+                  *countedBeforeNotification,
+              "started and reply callbacks run on worker thread; count is "
+              "incremented before notification");
+    }
     check(result.seq == seq && result.seq == worker.currentSeq(),
           "callback carries the current request sequence");
     check(result.pinyin == pinyin, "callback preserves request pinyin");
@@ -76,9 +101,16 @@ void run(const BackendConfig &config, const std::string &pinyin,
          const std::string &context, const std::vector<std::string> &expected,
          bool expectedOk = true, const std::string &expectedError = "") {
     LlmWorker worker;
+    check(worker.requestsStarted() == 0,
+          "new worker starts with zero requests");
     worker.start();
+    check(worker.requestsStarted() == 0,
+          "start alone does not count a request");
     const auto result = request(worker, config, pinyin, context);
     worker.stop();
+    check(worker.requestsStarted() == 1,
+          "HTTP errors, empty replies and redirects each count one logical "
+          "request; stop does not reset it");
     if (!result) {
         return;
     }
@@ -195,9 +227,13 @@ void testQueuedCancellation(const std::string &endpoint) {
     control(base, "/reset", true);
     LlmWorker worker;
     std::atomic<int> cancelledCallbacks{0};
-    const auto seq = worker.submit(testConfig(endpoint), "ceshi", "",
-                                   [&](FetchResult) { ++cancelledCallbacks; });
+    std::atomic<int> cancelledStarts{0};
+    const auto seq = worker.submit(
+        testConfig(endpoint), "ceshi", "",
+        [&](FetchResult) { ++cancelledCallbacks; }, [&] { ++cancelledStarts; });
+    check(worker.requestsStarted() == 0, "queued submission is not yet sent");
     worker.cancelAll();
+    check(worker.requestsStarted() == 0, "queued cancellation is not counted");
     check(worker.currentSeq() != seq,
           "cancelAll invalidates a queued sequence");
     worker.start();
@@ -206,7 +242,10 @@ void testQueuedCancellation(const std::string &endpoint) {
     check(result && result->ok &&
               result->candidates == std::vector<std::string>{"你好"},
           "worker accepts a new request after queued cancellation");
-    check(cancelledCallbacks == 0, "queued cancellation suppresses callback");
+    check(cancelledCallbacks == 0 && cancelledStarts == 0,
+          "queued cancellation suppresses reply and started callbacks");
+    check(worker.requestsStarted() == 1,
+          "only replacement transfer contributes to lifetime count");
     const auto stats = control(base, "/stats");
     check(stats.is_object() && stats.value("count", 0) == 1,
           "cancelled queued request is never sent");
@@ -225,6 +264,8 @@ void testInFlightCancellation(const std::string &endpoint, bool supersede) {
         worker.stop();
         return;
     }
+    check(worker.requestsStarted() == 1,
+          "in-flight request is counted before any result arrives");
     const auto started = std::chrono::steady_clock::now();
     if (!supersede) {
         worker.cancelAll();
@@ -239,6 +280,8 @@ void testInFlightCancellation(const std::string &endpoint, bool supersede) {
           "new request succeeds after in-flight cancellation");
     check(staleCallbacks == 0,
           "superseded/cancelled transfer does not deliver stale callback");
+    check(worker.requestsStarted() == 2,
+          "cancelled in-flight transfer and replacement both count as sent");
     check(elapsed < 2500ms,
           "cancellation aborts slow transfer instead of waiting for its reply");
 }
@@ -263,7 +306,10 @@ void testStopAndRestart(const std::string &endpoint) {
     check(worker.currentSeq() != seq,
           "stop invalidates sequences already queued for delivery");
     check(stoppedCallbacks == 0, "stop suppresses in-flight callback");
+    check(worker.requestsStarted() == 1,
+          "stop retains the count of the aborted in-flight request");
     worker.start();
+    check(worker.requestsStarted() == 1, "restart does not reset statistics");
     const auto result = request(worker, testConfig(endpoint));
     check(result && result->ok,
           "worker curl handle remains usable after restart");
@@ -297,6 +343,8 @@ void testConcurrentSubmissions(const std::string &endpoint) {
     for (auto &thread : submitters) {
         thread.join();
     }
+    check(worker.requestsStarted() == 0,
+          "concurrent submissions are not counted while queued");
     // Before start(), every concurrent submission is still queued. The job
     // retained under mutex_ must be exactly the one with the newest sequence.
     worker.start();
@@ -313,8 +361,9 @@ void testConcurrentSubmissions(const std::string &endpoint) {
     }
     worker.stop();
     const auto stats = control(base, "/stats");
-    check(stats.is_object() && stats.value("count", 0) == 1,
-          "concurrent queued submissions send only one request");
+    check(stats.is_object() && stats.value("count", 0) == 1 &&
+              worker.requestsStarted() == 1,
+          "concurrent queued submissions count only the one retained request");
 }
 
 void testInvalidUtf8Config(const std::string &endpoint) {
@@ -324,7 +373,10 @@ void testInvalidUtf8Config(const std::string &endpoint) {
     worker.start();
     auto invalidConfig = testConfig(endpoint);
     invalidConfig.systemPrompt += '\x80';
-    const auto invalid = request(worker, std::move(invalidConfig));
+    const auto invalid =
+        request(worker, std::move(invalidConfig), "nihao", "", false);
+    check(worker.requestsStarted() == 0,
+          "serialization failure does not count a network request");
     check(invalid && !invalid->ok && invalid->candidates.empty() &&
               invalid->error.starts_with("request processing failed:"),
           "invalid UTF-8 configuration reports failure without terminating "
@@ -336,6 +388,29 @@ void testInvalidUtf8Config(const std::string &endpoint) {
     const auto stats = control(base, "/stats");
     check(stats.is_object() && stats.value("count", 0) == 1,
           "invalid UTF-8 configuration is rejected before network access");
+}
+
+void testTransportFailure(const std::string &endpoint) {
+    const auto base = origin(endpoint);
+    control(base, "/reset", true);
+    const auto health = control(base, "/healthz");
+    if (!health.is_object() || !health.contains("dead_port")) {
+        check(false, "mock health has no reserved dead port");
+        return;
+    }
+    auto config = testConfig("http://127.0.0.1:" +
+                             std::to_string(health.at("dead_port").get<int>()) +
+                             "/v1/chat/completions");
+    LlmWorker worker;
+    worker.start();
+    const auto result = request(worker, config);
+    worker.stop();
+    check(result && !result->ok && result->candidates.empty() &&
+              worker.requestsStarted() == 1,
+          "connection refusal counts a started request even without a reply");
+    const auto stats = control(base, "/stats");
+    check(stats.is_object() && stats.value("count", 0) == 0,
+          "transport failure is counted independently of server POSTs");
 }
 
 void testHandleReuse(const std::string &endpoint) {
@@ -384,6 +459,7 @@ int main(int argc, char **argv) {
     testStopAndRestart(endpoint);
     testConcurrentSubmissions(endpoint);
     testInvalidUtf8Config(endpoint);
+    testTransportFailure(endpoint);
     testHandleReuse(endpoint);
 
     if (failures != 0) {

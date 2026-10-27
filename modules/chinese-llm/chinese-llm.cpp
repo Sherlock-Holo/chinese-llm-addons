@@ -8,6 +8,7 @@
 #include "llmworker.h"
 #include "native/pinyin/pinyin.h"
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/log.h>
@@ -21,8 +22,10 @@
 #include <fcitx/text.h>
 #include <fcitx/userinterface.h>
 #include <fcitx/userinterfacemanager.h>
+#include <format>
 #include <functional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -100,6 +103,33 @@ ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
                 toggle();
             }
         });
+    requestsAction_.registerAction("chinese-llm-stat-requests",
+                                   &instance_->userInterfaceManager());
+    overlapAction_.registerAction("chinese-llm-stat-overlap",
+                                  &instance_->userInterfaceManager());
+    rateAction_.registerAction("chinese-llm-stat-rate",
+                               &instance_->userInterfaceManager());
+    requestsAction_.setIcon("view-statistics");
+    overlapAction_.setIcon("view-statistics");
+    rateAction_.setIcon("view-statistics");
+    requestsAction_.setLongText(
+        D_("chinese-llm",
+           "Requests started in this Fcitx session, including failures and "
+           "cancellations. Valid requests returned usable candidates for the "
+           "current input. Cache hits are not requests."));
+    overlapAction_.setLongText(
+        D_("chinese-llm",
+           "Valid requests with at least one candidate identical to any native "
+           "candidate. Each request is counted once, before applying the "
+           "candidate "
+           "display limit."));
+    rateAction_.setLongText(D_(
+        "chinese-llm",
+        "Overlapping requests divided by valid requests. No rate is shown "
+        "until "
+        "a valid request completes. Statistics reset when Fcitx restarts; no "
+        "input text is saved."));
+    refreshStatistics();
     reloadConfig();
 
     // Fired by the pinyin engine after it has rebuilt the candidate list, so
@@ -151,7 +181,13 @@ void ChineseLlm::activate(const InputMethodEntry &, InputContextEvent &event) {
     auto *ic = event.inputContext();
     invalidateState(ic, ic->propertyFor(&factory_));
     pinyin_->activate(pinyinEntry_, event);
-    ic->statusArea().addAction(StatusGroup::InputMethod, &toggleAction_);
+    // Refresh before attaching: a transfer may have started while another IM
+    // was active. Every row belongs only to our own InputMethod status group.
+    refreshStatistics();
+    for (auto *action :
+         {&toggleAction_, &requestsAction_, &overlapAction_, &rateAction_}) {
+        ic->statusArea().addAction(StatusGroup::InputMethod, action);
+    }
     toggleAction_.update(ic);
 }
 
@@ -513,9 +549,23 @@ void ChineseLlm::dispatchRequest(fcitx::InputContext *ic, LlmState *state,
                 if (result.candidates.empty()) {
                     return;
                 }
+                // Only fresh, usable network results enter the denominator.
+                // Account before insertion, so neither our own candidates nor
+                // later cache/UI replays can be mistaken for native matches.
+                self->compareNativeCandidates(ic, result.candidates);
                 self->rememberCandidates(cacheKey(result.pinyin, context),
                                          result.candidates);
                 self->insertCandidates(ic, state, state->candidates);
+            });
+        },
+        [dispatcher = &dispatcher_, owner = watch()] {
+            // Start notifications must survive seq/IC invalidation: the
+            // transfer was still attempted even if typing cancels its reply.
+            // Never access Fcitx actions from the worker thread.
+            dispatcher->schedule([owner] {
+                if (auto *self = owner.get()) {
+                    self->refreshStatistics();
+                }
             });
         });
 }
@@ -647,13 +697,93 @@ void ChineseLlm::refreshStatus() {
     toggleAction_.setChecked(enabled);
     toggleAction_.setHotkey(config_.toggleKey.value());
     instance_->inputContextManager().foreach([this](InputContext *ic) {
-        if (isLlmInputMethod(ic) && ic->statusArea().isChild(&toggleAction_)) {
+        if (isLlmInputMethod(ic) &&
+            (ic->hasFocus() || ic == instance_->mostRecentInputContext()) &&
+            ic->statusArea().isChild(&toggleAction_)) {
             // StatusArea refresh also republishes the AI/PY input method label.
             // Do not rebuild GNOME's status menu on every keystroke.
             toggleAction_.update(ic);
         }
         return true;
     });
+}
+
+void ChineseLlm::compareNativeCandidates(
+    InputContext *ic, const std::vector<std::string> &candidates) {
+    const auto list = ic->inputPanel().candidateList();
+    auto *native = list ? list->toModifiable() : nullptr;
+    if (!native || candidates.empty()) {
+        return;
+    }
+    std::unordered_set<std::string> nativeTexts;
+    nativeTexts.reserve(native->totalSize());
+    for (int i = 0; i < native->totalSize(); ++i) {
+        const auto &candidate = native->candidateFromAll(i);
+        if (!dynamic_cast<const LlmCandidateWord *>(&candidate)) {
+            nativeTexts.insert(candidate.text().toString());
+        }
+    }
+    if (nativeTexts.empty()) {
+        return;
+    }
+    ++comparedRequests_;
+    // This is request-level any-match overlap, not top-1 agreement or the
+    // number of matching candidates. Compare all sanitized output, regardless
+    // of display position/limit/badge. Temporary texts never leave this call.
+    if (std::ranges::any_of(candidates, [&nativeTexts](const auto &candidate) {
+            return nativeTexts.contains(candidate);
+        })) {
+        ++overlappingRequests_;
+    }
+    refreshStatistics();
+}
+
+void ChineseLlm::refreshStatistics() {
+    auto statistics = requestStatistics();
+    // Standard formatting is locale-independent here: no thousands separators
+    // or ASCII ':' can accidentally enter the Kimpanel property protocol.
+    const auto rate =
+        statistics.compared
+            ? std::format("{:.1f}%",
+                          100.0 * static_cast<double>(statistics.overlapping) /
+                              static_cast<double>(statistics.compared))
+            : std::string("—");
+    const std::array<std::pair<SimpleAction *, std::string>, 3> rows{{
+        {&requestsAction_,
+         std::vformat(
+             D_("chinese-llm", "LLM requests {0} (valid {1})"),
+             std::make_format_args(statistics.sent, statistics.compared))},
+        {&overlapAction_,
+         std::vformat(D_("chinese-llm", "LLM overlapping requests {0}"),
+                      std::make_format_args(statistics.overlapping))},
+        {&rateAction_, std::vformat(D_("chinese-llm", "LLM overlap rate {0}"),
+                                    std::make_format_args(rate))},
+    }};
+    std::vector<SimpleAction *> changed;
+    for (const auto &[action, text] : rows) {
+        if (action->shortText(nullptr) != text) {
+            action->setShortText(text);
+            changed.push_back(action);
+        }
+    }
+    if (changed.empty()) {
+        return;
+    }
+    instance_->inputContextManager().foreach(
+        [this, &changed](InputContext *ic) {
+            // Kimpanel also accepts its old, unfocused lastInputContext_.
+            // Never let a late start notification republish a dormant IM's
+            // menu over another window. mostRecent preserves shell menus.
+            if (isLlmInputMethod(ic) &&
+                (ic->hasFocus() || ic == instance_->mostRecentInputContext())) {
+                for (auto *action : changed) {
+                    if (ic->statusArea().isChild(action)) {
+                        action->update(ic);
+                    }
+                }
+            }
+            return true;
+        });
 }
 
 void ChineseLlm::noteError(const std::string &error) {

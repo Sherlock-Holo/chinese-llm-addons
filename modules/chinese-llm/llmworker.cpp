@@ -84,7 +84,8 @@ void LlmWorker::stop() {
 }
 
 uint64_t LlmWorker::submit(BackendConfig config, std::string pinyin,
-                           std::string context, FetchCallback callback) {
+                           std::string context, FetchCallback callback,
+                           std::function<void()> started) {
     uint64_t seq;
     {
         const std::lock_guard<std::mutex> lock(mutex_);
@@ -99,7 +100,8 @@ uint64_t LlmWorker::submit(BackendConfig config, std::string pinyin,
                              .config = std::move(config),
                              .pinyin = std::move(pinyin),
                              .context = std::move(context),
-                             .callback = std::move(callback)});
+                             .callback = std::move(callback),
+                             .started = std::move(started)});
     }
     cv_.notify_one();
     return seq;
@@ -236,6 +238,13 @@ bool LlmWorker::perform(const Job &job, std::string &body, std::string &error) {
             break;
         }
 
+        // pending_ can be replaced without ever reaching curl. Count only
+        // logical transfer attempts here, not submissions or redirect hops.
+        // A started transfer remains counted even when its reply is discarded.
+        requestsStarted_.fetch_add(1, std::memory_order_relaxed);
+        if (job.started) {
+            job.started();
+        }
         const auto code = curl_easy_perform(curl_);
         if (code != CURLE_OK) {
             error =

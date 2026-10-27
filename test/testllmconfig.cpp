@@ -5,12 +5,14 @@
 #include "chinese-llm.h"
 #include <algorithm>
 #include <clocale>
+#include <cstdint>
 #include <cstdlib>
 #include <fcitx-config/dbushelper.h>
 #include <fcitx-config/iniparser.h>
 #include <fcitx-config/rawconfig.h>
 #include <fcitx-utils/dbus/variant.h>
 #include <filesystem>
+#include <format>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -166,13 +168,94 @@ int main(int argc, char *argv[]) {
             {"Click or use the toggle shortcut to enable or disable LLM "
              "candidates. Native pinyin remains available when disabled.",
              "点击此项或使用启用／停用快捷键切换 LLM "
-             "候选词。停用后仍可使用原生拼音。"}};
+             "候选词。停用后仍可使用原生拼音。"},
+            {"LLM requests {0} (valid {1})", "LLM 请求 {0}（有效 {1}）"},
+            {"LLM overlapping requests {0}", "LLM 重叠请求 {0}"},
+            {"LLM overlap rate {0}", "LLM 重叠率 {0}"},
+            {"Requests started in this Fcitx session, including failures and "
+             "cancellations. Valid requests returned usable candidates for "
+             "the current input. Cache hits are not requests.",
+             "本次 Fcitx 运行发起的请求，包括失败和取消。有效请求指返回可用候"
+             "选且仍对应当前输入的请求。缓存命中不算请求。"},
+            {"Valid requests with at least one candidate identical to any "
+             "native candidate. Each request is counted once, before applying "
+             "the candidate display limit.",
+             "有效请求中至少一个候选与任意原生候选完全相同的请求数。每个请"
+             "求只计一次，不受候选显示数量限制。"},
+            {"Overlapping requests divided by valid requests. No rate is shown "
+             "until a valid request completes. Statistics reset when Fcitx "
+             "restarts; no input text is saved.",
+             "重叠请求数除以有效请求数。没有有效请求时不显示比例。重启 "
+             "Fcitx 后统计清零，不保存输入文本。"}};
         for (const auto &[english, translation] : statusTranslations) {
             if (fcitx::translateDomain("chinese-llm", english) !=
                 (chinese ? translation : english)) {
-                std::cerr << "wrong localized LLM status text\n";
+                std::cerr << "wrong localized LLM status text: " << english
+                          << '\n';
                 return 1;
             }
+        }
+        // Format translated short text, not just the untranslated placeholders.
+        // All statistics must remain readable on panels that omit tooltips.
+        try {
+            const auto checkFormat = [&](const char *pattern,
+                                         const std::string &expectedText,
+                                         const auto &...args) {
+                const auto actual =
+                    std::vformat(fcitx::translateDomain("chinese-llm", pattern),
+                                 std::make_format_args(args...));
+                if (actual != expectedText) {
+                    std::cerr << "wrong formatted LLM status text: " << pattern
+                              << " -> " << actual << '\n';
+                    return false;
+                }
+                return true;
+            };
+            const std::uint64_t sent = 17;
+            const std::uint64_t compared = 3;
+            const std::uint64_t overlapping = 1;
+            const std::uint64_t zero = 0;
+            const std::string noRate = "—";
+            const auto rate = std::format("{:.1f}%", 100.0 / 3.0);
+            const auto zeroRate = std::format("{:.1f}%", 0.0);
+            const auto fullRate = std::format("{:.1f}%", 100.0);
+            if (!checkFormat("LLM requests {0} (valid {1})",
+                             chinese ? "LLM 请求 17（有效 3）"
+                                     : "LLM requests 17 (valid 3)",
+                             sent, compared) ||
+                !checkFormat("LLM requests {0} (valid {1})",
+                             chinese ? "LLM 请求 0（有效 0）"
+                                     : "LLM requests 0 (valid 0)",
+                             zero, zero) ||
+                !checkFormat("LLM overlapping requests {0}",
+                             chinese ? "LLM 重叠请求 1"
+                                     : "LLM overlapping requests 1",
+                             overlapping) ||
+                !checkFormat("LLM overlapping requests {0}",
+                             chinese ? "LLM 重叠请求 0"
+                                     : "LLM overlapping requests 0",
+                             zero) ||
+                !checkFormat("LLM overlap rate {0}",
+                             chinese ? "LLM 重叠率 —" : "LLM overlap rate —",
+                             noRate) ||
+                !checkFormat("LLM overlap rate {0}",
+                             chinese ? "LLM 重叠率 33.3%"
+                                     : "LLM overlap rate 33.3%",
+                             rate) ||
+                !checkFormat("LLM overlap rate {0}",
+                             chinese ? "LLM 重叠率 0.0%"
+                                     : "LLM overlap rate 0.0%",
+                             zeroRate) ||
+                !checkFormat("LLM overlap rate {0}",
+                             chinese ? "LLM 重叠率 100.0%"
+                                     : "LLM overlap rate 100.0%",
+                             fullRate)) {
+                return 1;
+            }
+        } catch (const std::format_error &error) {
+            std::cerr << "invalid localized LLM status placeholders: "
+                      << error.what() << '\n';
+            return 1;
         }
         // The private catalog must also retain native pinyin/helper labels.
         if (std::string(

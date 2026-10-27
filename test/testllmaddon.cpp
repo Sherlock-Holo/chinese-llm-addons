@@ -32,13 +32,17 @@
 #include <fcitx/userinterfacemanager.h>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <locale>
+#include <map>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace fcitx;
@@ -103,6 +107,20 @@ size_t mockRequestCount(const std::string &endpoint) {
         throw std::runtime_error("mock stats unavailable");
     }
     return nlohmann::json::parse(body).at("count").get<size_t>();
+}
+
+// Called only inside a main-thread callback after synchronous dispatch with
+// DebounceMs=0. Worker start notifications are queued until that callback
+// returns.
+void waitForMockRequests(const std::string &endpoint, size_t expected) {
+    const auto deadline = Clock::now() + std::chrono::seconds(1);
+    while (Clock::now() < deadline) {
+        if (mockRequestCount(endpoint) == expected) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    throw std::runtime_error("mock did not observe synchronous request start");
 }
 
 std::string configSnapshot(const Configuration *config) {
@@ -274,7 +292,15 @@ int main(int argc, char **argv) {
                                              "native-description",
                                              "cloud-badge",
                                              "badge-off",
-                                             "llm-status"};
+                                             "llm-status",
+                                             "stats-overlap",
+                                             "stats-empty",
+                                             "stats-error",
+                                             "stats-invalid",
+                                             "stats-all-filtered",
+                                             "stats-limit",
+                                             "stats-rate",
+                                             "stats-focus"};
     if (std::ranges::find(scenarios, scenario) == scenarios.end()) {
         std::cerr << "unknown scenario: " << scenario << '\n';
         return EXIT_FAILURE;
@@ -304,7 +330,22 @@ int main(int argc, char **argv) {
     InputContext *ic = nullptr;
     AddonInstance *frontend = nullptr;
     AddonInstance *llm = nullptr;
+    fcitx::chinesellm::ChineseLlm *llmAddon = nullptr;
     AddonInstance *pinyin = nullptr;
+    int statisticsStatusUpdates = 0;
+    std::unique_ptr<HandlerTableEntry<EventHandler>> statisticsWatcher;
+    std::unique_ptr<HandlerTableEntry<EventHandler>> focusWatcher;
+    std::vector<ScopedConnection> focusActionConnections;
+    InputContext *dormantIc = nullptr;
+    ICUUID dormantUuid{};
+    int dormantStatusUpdates = 0;
+    int activeStatusUpdates = 0;
+    int dormantActionUpdates = 0;
+    int activeActionUpdates = 0;
+    int dormantStatusBefore = 0;
+    int activeStatusBefore = 0;
+    int dormantActionBefore = 0;
+    int activeActionBefore = 0;
     ICUUID uuid{};
     Clock::time_point start;
     Clock::time_point stageStart;
@@ -327,7 +368,162 @@ int main(int argc, char **argv) {
                                                ? "shuangpin"
                                                : kLlmInputMethod;
 
+    auto statisticsActions = [&]() {
+        return std::vector<Action *>{
+            instance.userInterfaceManager().lookupAction(
+                "chinese-llm-stat-requests"),
+            instance.userInterfaceManager().lookupAction(
+                "chinese-llm-stat-overlap"),
+            instance.userInterfaceManager().lookupAction(
+                "chinese-llm-stat-rate")};
+    };
+    auto checkStatistics = [&](uint64_t sent, uint64_t compared,
+                               uint64_t overlapping) {
+        require(llmAddon, "LLM statistics public API is unavailable");
+        const auto actual = llmAddon->requestStatistics();
+        require(actual.sent == sent && actual.compared == compared &&
+                    actual.overlapping == overlapping,
+                "request statistics mismatch: got " +
+                    std::to_string(actual.sent) + "/" +
+                    std::to_string(actual.compared) + "/" +
+                    std::to_string(actual.overlapping) + ", expected " +
+                    std::to_string(sent) + "/" + std::to_string(compared) +
+                    "/" + std::to_string(overlapping));
+        std::string rate = "—";
+        if (compared) {
+            std::ostringstream formatted;
+            formatted.imbue(std::locale::classic());
+            formatted << std::fixed << std::setprecision(1)
+                      << 100.0 * overlapping / compared << '%';
+            rate = formatted.str();
+        }
+        const std::vector<std::pair<std::string, std::string>> labels{
+            {"LLM requests " + std::to_string(sent) + " (valid " +
+                 std::to_string(compared) + ")",
+             "LLM 请求 " + std::to_string(sent) + "（有效 " +
+                 std::to_string(compared) + "）"},
+            {"LLM overlapping requests " + std::to_string(overlapping),
+             "LLM 重叠请求 " + std::to_string(overlapping)},
+            {"LLM overlap rate " + rate, "LLM 重叠率 " + rate}};
+        const auto actions = statisticsActions();
+        for (size_t i = 0; i < actions.size(); ++i) {
+            auto *action = actions[i];
+            require(action && dynamic_cast<SimpleAction *>(action) &&
+                        !action->isCheckable() && action->hotkey().empty(),
+                    "statistics item is missing/not a read-only SimpleAction");
+            const auto label = action->shortText(ic);
+            require(label == labels[i].first || label == labels[i].second,
+                    "statistics status label mismatch: " + label);
+            require(label.find(':') == std::string::npos &&
+                        action->longText(ic).find(':') == std::string::npos,
+                    "statistics item contains Kimpanel protocol delimiter");
+            if (ic) {
+                bool visible = instance.inputMethod(ic) == kLlmInputMethod;
+                // This standalone fixture cannot load Fcitx's statically
+                // linked keyboard addon. Password redirection then has no
+                // engine, so core activation returns before clearing the old
+                // status group. In that specific fallback, statistics must
+                // follow the retained private toggle, not an official IM.
+                if (ic->capabilityFlags().testAny(
+                        CapabilityFlag::PasswordOrSensitive) &&
+                    !instance.inputMethodEngine(ic)) {
+                    auto *toggle = instance.userInterfaceManager().lookupAction(
+                        "chinese-llm-toggle");
+                    require(toggle,
+                            "missing private toggle in password fixture");
+                    visible = ic->statusArea().isChild(toggle);
+                }
+                require(ic->statusArea().isChild(action) == visible,
+                        "statistics menu visibility leaked/lost across IMs");
+            }
+        }
+    };
+    auto clickStatistics = [&]() {
+        const auto before = llmAddon->requestStatistics();
+        const auto config = configSnapshot(llm->getConfig());
+        const auto nativeConfig = configSnapshot(llm->getSubConfig("pinyin"));
+        const auto *composition = ic->propertyAs<LlmState>("chinese-llm");
+        const auto generationBefore = composition->generation;
+        const auto seqBefore = composition->requestSeq;
+        const auto pinyinBefore = composition->pinyin;
+        const auto candidatesBefore = composition->candidates;
+        const auto *debounceBefore = composition->debounce.get();
+        const auto listBefore = ic->inputPanel().candidateList();
+        const auto preeditBefore = preeditText(ic);
+        const auto updatesBefore = statisticsStatusUpdates;
+        for (auto *action : statisticsActions()) {
+            action->activate(ic);
+            action->activate(nullptr);
+        }
+        checkStatistics(before.sent, before.compared, before.overlapping);
+        require(
+            configSnapshot(llm->getConfig()) == config &&
+                configSnapshot(llm->getSubConfig("pinyin")) == nativeConfig &&
+                composition->generation == generationBefore &&
+                composition->requestSeq == seqBefore &&
+                composition->pinyin == pinyinBefore &&
+                composition->candidates == candidatesBefore &&
+                composition->debounce.get() == debounceBefore &&
+                ic->inputPanel().candidateList() == listBefore &&
+                preeditText(ic) == preeditBefore &&
+                statisticsStatusUpdates == updatesBefore,
+            "read-only statistics click changed configuration/composition/UI");
+    };
     auto finish = [&](bool success, const std::string &message) {
+        if (success) {
+            struct ExpectedStatistics {
+                uint64_t sent;
+                uint64_t compared;
+                uint64_t overlapping;
+            };
+            const std::map<std::string, ExpectedStatistics> expected{
+                {"live", {1, 1, 1}},
+                {"debounce", {1, 1, 1}},
+                {"disabled", {0, 0, 0}},
+                {"dead", {1, 0, 0}},
+                {"preview", {1, 1, 1}},
+                {"reset", {2, 1, 1}},
+                {"partial", {1, 0, 0}},
+                {"toggle", {0, 0, 0}},
+                {"sensitive", {0, 0, 0}},
+                {"toggle-inflight", {1, 0, 0}},
+                {"sensitive-inflight", {1, 0, 0}},
+                {"context", {2, 2, 0}},
+                {"cache", {2, 2, 0}},
+                {"cooldown", {2, 0, 0}},
+                {"config", {2, 2, 2}},
+                {"filtered", {1, 1, 1}},
+                {"metadata", {0, 0, 0}},
+                {"original-pinyin", {0, 0, 0}},
+                {"original-shuangpin", {0, 0, 0}},
+                {"switch-inflight", {2, 1, 1}},
+                {"switch-results", {1, 1, 1}},
+                {"own-config", {0, 0, 0}},
+                {"virtual-keyboard", {1, 1, 1}},
+                {"preedit-click", {1, 1, 1}},
+                {"modifier-selection", {1, 1, 1}},
+                {"modifier-selection-global", {1, 1, 1}},
+                {"llm-alone", {1, 1, 1}},
+                {"private-settings", {0, 0, 0}},
+                {"customphrase-isolation", {0, 0, 0}},
+                {"learning-isolation", {0, 0, 0}},
+                {"learning-reload", {0, 0, 0}},
+                {"private-actions", {0, 0, 0}},
+                {"native-description", {0, 0, 0}},
+                {"cloud-badge", {1, 1, 1}},
+                {"badge-off", {1, 1, 1}},
+                {"llm-status", {0, 0, 0}},
+                {"stats-overlap", {1, 1, 1}},
+                {"stats-empty", {1, 0, 0}},
+                {"stats-error", {1, 0, 0}},
+                {"stats-invalid", {1, 0, 0}},
+                {"stats-all-filtered", {1, 0, 0}},
+                {"stats-limit", {1, 1, 1}},
+                {"stats-rate", {3, 3, 2}},
+                {"stats-focus", {2, 0, 0}}};
+            const auto &counts = expected.at(scenario);
+            checkStatistics(counts.sent, counts.compared, counts.overlapping);
+        }
         if (success && officialEngine && officialEntry && shuangpinEntry) {
             require(
                 configSnapshot(officialEngine->getConfigForInputMethod(
@@ -354,9 +550,18 @@ int main(int argc, char **argv) {
         } else {
             std::cerr << "FAIL [" << scenario << "]: " << message << '\n';
         }
+        focusActionConnections.clear();
+        focusWatcher.reset();
         if (ic) {
             frontend->call<ITestFrontend::destroyInputContext>(uuid);
+            if (ic == dormantIc) {
+                dormantIc = nullptr;
+            }
             ic = nullptr;
+        }
+        if (dormantIc) {
+            frontend->call<ITestFrontend::destroyInputContext>(dormantUuid);
+            dormantIc = nullptr;
         }
         instance.exit();
     };
@@ -415,7 +620,10 @@ int main(int argc, char **argv) {
             }
             officialEngine = dynamic_cast<InputMethodEngine *>(pinyin);
             llmEngine = dynamic_cast<InputMethodEngine *>(llm);
-            require((alone || officialEngine) && llmEngine,
+            // The runtime module is not linked into this executable; avoid an
+            // out-of-line RTTI reference for its concrete addon type.
+            llmAddon = static_cast<fcitx::chinesellm::ChineseLlm *>(llm);
+            require((alone || officialEngine) && llmEngine && llmAddon,
                     "official pinyin and LLM addon must both be input method "
                     "engines");
             const auto *entry =
@@ -514,6 +722,10 @@ int main(int argc, char **argv) {
                                   scenario == "badge-off" ? "False" : "True");
             config.setValueByPath("CandidateIndex",
                                   scenario == "cloud-badge" ? "1" : "2");
+            if (scenario == "stats-limit") {
+                config.setValueByPath("MaxCandidates", "1");
+                config.setValueByPath("ShowBadge", "False");
+            }
             config.setValueByPath("Model", "mock");
             config.setValueByPath("ApiKey", "");
             config.setValueByPath("DebounceMs", "250");
@@ -527,6 +739,7 @@ int main(int argc, char **argv) {
                                       : "0");
             config.setValueByPath("MaxConsecutiveErrors", "2");
             llm->setConfig(config);
+            checkStatistics(0, 0, 0);
             require(
                 alone ||
                     (configSnapshot(officialEngine->getConfigForInputMethod(
@@ -576,6 +789,16 @@ int main(int argc, char **argv) {
                                                           : "Composing pinyin");
                 llm->setSubConfig("pinyin", preview);
             }
+            if (scenario == "stats-focus") {
+                RawConfig global;
+                global.setValueByPath("Behavior/ShareInputState", "No");
+                instance.globalConfig().load(global, true);
+                require(instance.globalConfig().shareInputState() ==
+                            PropertyPropagatePolicy::No,
+                        "two-IC probe requires independent input method state");
+                instance.inputContextManager().setPropertyPropagatePolicy(
+                    PropertyPropagatePolicy::No);
+            }
             uuid = frontend->call<ITestFrontend::createInputContext>(
                 "testllmaddon");
             ic = instance.inputContextManager().findByUUID(uuid);
@@ -600,6 +823,52 @@ int main(int argc, char **argv) {
                         instance.inputMethod(ic) == initialInputMethod,
                     "requested input method is not active: " +
                         initialInputMethod);
+            statisticsWatcher = instance.watchEvent(
+                EventType::InputContextUpdateUI, EventWatcherPhase::Default,
+                [&](Event &event) {
+                    auto &update =
+                        static_cast<InputContextUpdateUIEvent &>(event);
+                    if (update.inputContext() == ic &&
+                        update.component() ==
+                            UserInterfaceComponent::StatusArea) {
+                        ++statisticsStatusUpdates;
+                    }
+                });
+            checkStatistics(0, 0, 0);
+            clickStatistics();
+            if (scenario == "stats-focus") {
+                dormantIc = ic;
+                dormantUuid = uuid;
+                focusWatcher = instance.watchEvent(
+                    EventType::InputContextUpdateUI, EventWatcherPhase::Default,
+                    [&](Event &event) {
+                        auto &update =
+                            static_cast<InputContextUpdateUIEvent &>(event);
+                        if (update.component() !=
+                            UserInterfaceComponent::StatusArea) {
+                            return;
+                        }
+                        if (update.inputContext() == dormantIc) {
+                            ++dormantStatusUpdates;
+                        } else if (update.inputContext() == ic) {
+                            ++activeStatusUpdates;
+                        }
+                    });
+                auto actions = statisticsActions();
+                actions.push_back(instance.userInterfaceManager().lookupAction(
+                    "chinese-llm-toggle"));
+                for (auto *action : actions) {
+                    focusActionConnections.emplace_back(
+                        action->connect<Action::Update>(
+                            [&](InputContext *target) {
+                                if (target == dormantIc) {
+                                    ++dormantActionUpdates;
+                                } else if (target == ic) {
+                                    ++activeActionUpdates;
+                                }
+                            }));
+                }
+            }
             if (scenario == "llm-status") {
                 auto *action = instance.userInterfaceManager().lookupAction(
                     "chinese-llm-toggle");
@@ -681,6 +950,7 @@ int main(int argc, char **argv) {
                 action->activate(nullptr);
                 require(configSnapshot(llm->getConfig()) == beforeStaleClick,
                         "null menu click toggled LLM");
+                clickStatistics();
                 ic->focusIn();
                 for (const auto *nativeEntry :
                      {officialEntry, shuangpinEntry}) {
@@ -693,6 +963,8 @@ int main(int argc, char **argv) {
                     require(
                         configSnapshot(llm->getConfig()) == beforeStaleClick,
                         "stale LLM action toggled from official input method");
+                    checkStatistics(0, 0, 0);
+                    clickStatistics();
                 }
                 instance.setCurrentInputMethod(ic, kLlmInputMethod, true);
                 require(ic->statusArea().isChild(action),
@@ -1028,7 +1300,8 @@ int main(int argc, char **argv) {
                         "global shortcut probe did not restore independent "
                         "LLM拼音");
             }
-            if (scenario == "context" || scenario == "cache") {
+            if (scenario == "context" || scenario == "cache" ||
+                scenario == "stats-rate") {
                 ic->surroundingText().setText("甲乙丙丁戊", 3, 3);
                 ic->updateSurroundingText();
             }
@@ -1049,9 +1322,28 @@ int main(int argc, char **argv) {
                             "LLM engine did not delegate virtual keyboard key");
                 }
             } else {
-                type(originalPinyin      ? "nihao"
-                     : originalShuangpin ? "nihk"
-                                         : kKeys);
+                type(originalPinyin || scenario == "stats-overlap" ? "nihao"
+                     : originalShuangpin                           ? "nihk"
+                                                                   : kKeys);
+            }
+            if (scenario == "stats-focus") {
+                // Input was accumulated with normal debounce. Reconfigure and
+                // explicitly rebuild once, dispatching only the complete input.
+                RawConfig immediate;
+                immediate.setValueByPath("DebounceMs", "0");
+                llm->setConfig(immediate);
+                ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+                waitForMockRequests(endpoint, 1);
+                require(llmAddon->requestStatistics().sent == 1,
+                        "shell-focus probe did not start exactly one transfer");
+                ic->focusOut();
+                require(!ic->hasFocus() &&
+                            instance.mostRecentInputContext() == ic &&
+                            instance.inputMethod(ic) == kLlmInputMethod &&
+                            ic->statusArea().isChild(statisticsActions()[0]),
+                        "shell focus loss did not retain most-recent LLM menu");
+                dormantStatusBefore = dormantStatusUpdates;
+                dormantActionBefore = dormantActionUpdates;
             }
             generation = state()->generation;
             if (scenario == "disabled" || scenario == "dead") {
@@ -1124,7 +1416,234 @@ int main(int argc, char **argv) {
                         require(elapsed < std::chrono::seconds(8),
                                 "scenario deadline exceeded");
                         const bool appeared = hasCandidate(ic, kModelWord);
-                        if (original) {
+                        if (scenario == "stats-focus") {
+                            if (stage == 0 &&
+                                dormantActionUpdates > dormantActionBefore) {
+                                checkStatistics(1, 0, 0);
+                                require(
+                                    dormantStatusUpdates > dormantStatusBefore,
+                                    "most-recent shell-unfocused IC did not "
+                                    "receive queued statistics refresh");
+                                uuid = frontend->call<
+                                    ITestFrontend::createInputContext>(
+                                    "testllmaddon-focus");
+                                ic = instance.inputContextManager().findByUUID(
+                                    uuid);
+                                require(ic && ic != dormantIc,
+                                        "two-IC probe failed to create B");
+                                ic->focusIn();
+                                instance.setCurrentInputMethod(ic, "pinyin",
+                                                               true);
+                                require(
+                                    !dormantIc->hasFocus() && ic->hasFocus() &&
+                                        instance.mostRecentInputContext() ==
+                                            ic &&
+                                        instance.inputMethod(dormantIc) ==
+                                            kLlmInputMethod &&
+                                        instance.inputMethod(ic) == "pinyin" &&
+                                        dormantIc->statusArea().isChild(
+                                            statisticsActions()[0]),
+                                    "A must retain an unfocused LLM menu "
+                                    "while independent B selects official");
+                                checkStatistics(1, 0, 0);
+                                dormantActionBefore = dormantActionUpdates;
+                                dormantStatusBefore = dormantStatusUpdates;
+                                RawConfig disabled;
+                                disabled.setValueByPath("Enabled", "False");
+                                llm->setConfig(disabled);
+                                require(dormantActionUpdates ==
+                                                dormantActionBefore &&
+                                            dormantStatusUpdates ==
+                                                dormantStatusBefore,
+                                        "config status broadcast republished "
+                                        "dormant A over B's official menu");
+                                instance.setCurrentInputMethod(
+                                    ic, kLlmInputMethod, true);
+                                type(kKeys);
+                                RawConfig enabled;
+                                enabled.setValueByPath("Enabled", "True");
+                                llm->setConfig(enabled);
+                                ic->updateUserInterface(
+                                    UserInterfaceComponent::InputPanel);
+                                // Block this callback until the worker has
+                                // queued started. Switch B before returning to
+                                // the event loop; no dispatcher detach is used.
+                                waitForMockRequests(endpoint, 2);
+                                require(llmAddon->requestStatistics().sent == 2,
+                                        "focus probe did not dispatch only one "
+                                        "complete request per IC");
+                                instance.setCurrentInputMethod(ic, "pinyin",
+                                                               true);
+                                require(instance.inputMethod(dormantIc) ==
+                                                kLlmInputMethod &&
+                                            !dormantIc->hasFocus() &&
+                                            instance.mostRecentInputContext() ==
+                                                ic &&
+                                            dormantIc->statusArea().isChild(
+                                                statisticsActions()[0]) &&
+                                            !ic->statusArea().isChild(
+                                                statisticsActions()[0]),
+                                        "queued start probe lost retained A "
+                                        "or active B's official isolation");
+                                dormantActionBefore = dormantActionUpdates;
+                                dormantStatusBefore = dormantStatusUpdates;
+                                activeActionBefore = activeActionUpdates;
+                                activeStatusBefore = activeStatusUpdates;
+                                stage = 1;
+                                stageStart = Clock::now();
+                            } else if (stage == 1 &&
+                                       stageElapsed >
+                                           std::chrono::milliseconds(800)) {
+                                // Global labels must advance, but their update
+                                // must not republish either dormant LLM A or
+                                // currently official B to Kimpanel.
+                                checkStatistics(2, 0, 0);
+                                require(
+                                    dormantActionUpdates ==
+                                            dormantActionBefore &&
+                                        dormantStatusUpdates ==
+                                            dormantStatusBefore &&
+                                        activeActionUpdates ==
+                                            activeActionBefore &&
+                                        activeStatusUpdates ==
+                                            activeStatusBefore,
+                                    "queued start refreshed dormant A or "
+                                    "official B instead of only global text");
+                                clickStatistics();
+                                finish(true, "");
+                            }
+                        } else if (scenario == "stats-overlap") {
+                            const auto counts = llmAddon->requestStatistics();
+                            if (counts.compared == 1) {
+                                checkStatistics(1, 1, 1);
+                                require(
+                                    state()->candidates ==
+                                            std::vector<std::string>{"你好"} &&
+                                        hasCandidate(ic, "你好"),
+                                    "all-overlap reply lost native fallback");
+                                auto *bulk =
+                                    ic->inputPanel().candidateList()->toBulk();
+                                int matches = 0;
+                                for (int i = 0; i < bulk->totalSize(); ++i) {
+                                    const auto &word =
+                                        bulk->candidateFromAll(i);
+                                    if (word.text().toString() == "你好") {
+                                        ++matches;
+                                        require(word.comment().toString().find(
+                                                    "\u2601") ==
+                                                    std::string::npos,
+                                                "all-overlap native word was "
+                                                "marked as LLM");
+                                    }
+                                }
+                                require(
+                                    matches == 1,
+                                    "all-overlap reply duplicated native word");
+                                ic->updateUserInterface(
+                                    UserInterfaceComponent::InputPanel);
+                                clickStatistics();
+                                checkStatistics(1, 1, 1);
+                                checkCommit("你好");
+                                finish(true, "");
+                            }
+                        } else if (scenario == "stats-empty" ||
+                                   scenario == "stats-error" ||
+                                   scenario == "stats-invalid" ||
+                                   scenario == "stats-all-filtered") {
+                            require(!appeared && state()->candidates.empty(),
+                                    "unusable reply produced model candidates");
+                            if (elapsed > std::chrono::milliseconds(1800)) {
+                                checkStatistics(1, 0, 0);
+                                require(hasCandidate(ic, "他们正在开会"),
+                                        "unusable reply lost native fallback");
+                                ic->updateUserInterface(
+                                    UserInterfaceComponent::InputPanel);
+                                clickStatistics();
+                                checkStatistics(1, 0, 0);
+                                finish(true, "");
+                            }
+                        } else if (scenario == "stats-limit" && appeared) {
+                            checkStatistics(1, 1, 1);
+                            require(
+                                state()->candidates ==
+                                        std::vector<std::string>{kModelWord,
+                                                                 "他们正在开会",
+                                                                 kOtherWord} &&
+                                    !hasCandidate(ic, kOtherWord),
+                                "MaxCandidates affected comparison input or "
+                                "failed to limit displayed words");
+                            ic->updateUserInterface(
+                                UserInterfaceComponent::InputPanel);
+                            clickStatistics();
+                            checkStatistics(1, 1, 1);
+                            finish(true, "");
+                        } else if (scenario == "stats-rate") {
+                            const auto counts = llmAddon->requestStatistics();
+                            if (stage == 0 && counts.sent == 1 &&
+                                counts.compared == 0 &&
+                                statisticsStatusUpdates > 0) {
+                                checkStatistics(1, 0, 0);
+                                stage = 1;
+                            }
+                            if (stage <= 1 && appeared) {
+                                require(stage == 1,
+                                        "request start did not refresh "
+                                        "statistics before its delayed reply");
+                                checkStatistics(1, 1, 0);
+                                require(statisticsStatusUpdates >= 2,
+                                        "accepted reply did not refresh "
+                                        "statistics status area");
+                                ic->updateUserInterface(
+                                    UserInterfaceComponent::InputPanel);
+                                clickStatistics();
+                                checkStatistics(1, 1, 0);
+                                ic->reset();
+                                llm->reloadConfig();
+                                checkStatistics(1, 1, 0);
+                                auto *toggle =
+                                    instance.userInterfaceManager()
+                                        .lookupAction("chinese-llm-toggle");
+                                toggle->activate(ic);
+                                checkStatistics(1, 1, 0);
+                                toggle->activate(ic);
+                                RawConfig change;
+                                change.setValueByPath("MaxCandidates", "1");
+                                change.setValueByPath("ShowBadge", "False");
+                                llm->setConfig(change);
+                                checkStatistics(1, 1, 0);
+                                for (const auto *nativeEntry :
+                                     {officialEntry, shuangpinEntry}) {
+                                    instance.setCurrentInputMethod(
+                                        ic, nativeEntry->uniqueName(), true);
+                                    checkStatistics(1, 1, 0);
+                                    clickStatistics();
+                                }
+                                instance.setCurrentInputMethod(
+                                    ic, kLlmInputMethod, true);
+                                checkStatistics(1, 1, 0);
+                                ic->surroundingText().setText("", 0, 0);
+                                ic->updateSurroundingText();
+                                type(kKeys);
+                                stage = 2;
+                            } else if (stage == 2 && appeared) {
+                                // The mixed reply has two candidates, but is
+                                // exactly one overlapping request (50.0%).
+                                checkStatistics(2, 2, 1);
+                                ic->updateUserInterface(
+                                    UserInterfaceComponent::InputPanel);
+                                clickStatistics();
+                                checkStatistics(2, 2, 1);
+                                ic->reset();
+                                type("nihao");
+                                stage = 3;
+                            } else if (stage == 3 && counts.compared == 3) {
+                                // A third all-overlap request tests rounding
+                                // (66.7%) and no visible LLM insertion.
+                                checkStatistics(3, 3, 2);
+                                clickStatistics();
+                                finish(true, "");
+                            }
+                        } else if (original) {
                             require(!appeared && state()->pinyin.empty() &&
                                         state()->requestSeq == 0 &&
                                         !state()->debounce,
