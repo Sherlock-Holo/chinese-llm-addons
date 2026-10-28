@@ -17,7 +17,7 @@
 # to this checkout. Only prepare() reads the tree; `--noextract` reuses the
 # prepared snapshot for an incremental rebuild.
 pkgname=chinese-llm-addons
-pkgver=5.1.15.local.h5c57f73655873eaa
+pkgver=5.1.15.local.hbcc257cbe1fb524f
 pkgrel=1
 pkgdesc='Independent LLM Pinyin input method for Fcitx5 (keeps official Chinese addons)'
 arch=('x86_64')
