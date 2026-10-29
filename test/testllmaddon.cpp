@@ -54,6 +54,9 @@ namespace {
 constexpr char kLlmInputMethod[] = "llm-pinyin";
 constexpr char kKeys[] = "tamenzhengzaikaihui";
 constexpr char kModelWord[] = "她们正在开会";
+/// What the model says about the rest of the sentence once "他们" is accepted.
+constexpr char kPartialWord[] = "争在开会";
+constexpr char kAcceptedWord[] = "他们";
 constexpr char kOtherWord[] = "它们正在开会";
 constexpr char kContextBefore[] = "safe-context-before";
 constexpr char kContextAfter[] = "safe-context-after";
@@ -207,7 +210,8 @@ int main(int argc, char **argv) {
     }
     const std::vector<std::string> scenarios{
         "live",  "mixed",  "mixed-context-changed", "cache",   "sensitive",
-        "dead",  "toggle", "history-menu",          "stats-overlap", "llm-alone"};
+        "dead",  "toggle", "history-menu",          "stats-overlap", "llm-alone",
+        "partial"};
     if (std::ranges::find(scenarios, scenario) == scenarios.end()) {
         std::cerr << "unknown scenario: " << scenario << '\n';
         return EXIT_FAILURE;
@@ -410,7 +414,7 @@ int main(int argc, char **argv) {
                 {"cache", {2, 2, 0}},         {"sensitive", {0, 0, 0}},
                 {"dead", {1, 0, 0}},          {"toggle", {0, 0, 0}},
                 {"history-menu", {1, 1, 1}},  {"stats-overlap", {1, 1, 1}},
-                {"llm-alone", {1, 1, 1}}};
+                {"llm-alone", {1, 1, 1}},     {"partial", {1, 1, 0}}};
             const auto &counts = expected.at(scenario);
             checkStatistics(counts.sent, counts.compared, counts.overlapping);
             const auto &entries = llmAddon->requestHistory().entries();
@@ -458,6 +462,15 @@ int main(int argc, char **argv) {
                             entry.adoptedText == "你好",
                         "native equivalent candidate adoption was not recorded "
                         "separately from LLM selection");
+            } else if (scenario == "partial") {
+                const auto &entry = entryWithStatus("usable");
+                require(entries.size() == 1 && entry.pinyin.find("zheng") !=
+                                                   std::string::npos &&
+                            entry.pinyin.find("tamen") == std::string::npos &&
+                            entry.adoption == "llm" &&
+                            entry.adoptedText == kPartialWord,
+                        "partial history recorded the accepted words or "
+                        "lost the adoption");
             } else if (scenario == "dead") {
                 const auto &entry = entryWithStatus("error");
                 require(entry.started && !entry.error.empty() &&
@@ -649,7 +662,9 @@ int main(int argc, char **argv) {
             config.setValueByPath("PromptTemplate", "{context}\n{pinyin}");
             config.setValueByPath(
                 "ContextLength",
-                scenario == "mixed-context-changed" ? "64" : "2");
+                scenario == "mixed-context-changed" ? "64"
+                : scenario == "partial"             ? "4"
+                                                    : "2");
             config.setValueByPath(
                 "CacheSize",
                 scenario == "cache" || scenario == "history-menu" ? "256"
@@ -712,6 +727,10 @@ int main(int argc, char **argv) {
                 ic->surroundingText().setText("甲乙丙丁戊", 3, 3);
                 ic->updateSurroundingText();
             }
+            if (scenario == "partial") {
+                ic->surroundingText().setText("甲乙丙丁戊", 5, 5);
+                ic->updateSurroundingText();
+            }
             if (scenario == "llm-alone") {
                 type("zzzz");
                 require(
@@ -759,6 +778,37 @@ int main(int argc, char **argv) {
                         "and no model candidate");
             } else {
                 type(scenario == "stats-overlap" ? "nihao" : kKeys);
+            }
+            if (scenario == "partial") {
+                // With the cursor inside the pinyin the native candidates are
+                // for what is before it, so the model is asked about that too.
+                for (int i = 0; i < 3; ++i) {
+                    frontend->call<ITestFrontend::sendKeyEvent>(
+                        uuid, Key("Left"), false);
+                }
+                require(normalizedTypedKeys(state()->pinyin) ==
+                            "tamenzhengzaikai",
+                        "cursor inside the pinyin was ignored: " +
+                            state()->pinyin);
+                for (int i = 0; i < 3; ++i) {
+                    frontend->call<ITestFrontend::sendKeyEvent>(
+                        uuid, Key("Right"), false);
+                }
+                require(normalizedTypedKeys(state()->pinyin) == kKeys,
+                        "moving the cursor back lost the pinyin: " +
+                            state()->pinyin);
+                // Accept the first words of a long sentence and keep the rest.
+                require(hasCandidate(ic, kAcceptedWord),
+                        "native engine has no candidate for the first words");
+                selectCandidate(ic, kAcceptedWord);
+                require(!ic->inputPanel().candidateList()->empty() &&
+                            state()->selected == kAcceptedWord &&
+                            normalizedTypedKeys(state()->pinyin) ==
+                                "zhengzaikaihui",
+                        "partial selection did not leave the remaining "
+                        "pinyin as the LLM composition: pinyin=" +
+                            state()->pinyin + " selected=" +
+                            state()->selected);
             }
             generation = state()->generation;
             if (scenario == "dead") {
@@ -1281,6 +1331,55 @@ int main(int argc, char **argv) {
                                 type(kKeys);
                                 require(hasCandidate(ic, kModelWord),
                                         "expected synchronous cache hit");
+                                finish(true, "");
+                            }
+                        } else if (scenario == "partial") {
+                            if (stage == 0 && hasCandidate(ic, kPartialWord)) {
+                                // Context is what the user had typed plus the
+                                // words accepted a moment ago.
+                                require(state()->context == "丁戊他们" &&
+                                            state()->selected ==
+                                                kAcceptedWord,
+                                        "context lost the accepted words: " +
+                                            state()->context);
+                                // The engine learns the whole sentence; the
+                                // LLM candidate must not drop the accepted
+                                // part when it replaces the composition.
+                                const std::string whole =
+                                    std::string(kAcceptedWord) + kPartialWord;
+                                frontend->call<
+                                    ITestFrontend::pushCommitExpectation>(
+                                    whole);
+                                selectCandidate(ic, kPartialWord);
+                                require(ic->inputPanel().clientPreedit().empty() &&
+                                            ic->inputPanel().preedit().empty() &&
+                                            state()->pinyin.empty() &&
+                                            state()->selected.empty(),
+                                        "committing the LLM candidate left a "
+                                        "composition behind");
+                                type("shui");
+                                require(preeditText(ic) == "shui",
+                                        "engine kept the accepted words: " +
+                                            preeditText(ic));
+                                ic->reset();
+                                // A remainder shorter than MinPinyinLength is
+                                // not worth a request.
+                                type("nihaoa");
+                                selectCandidate(ic, "你好");
+                                require(!preeditText(ic).empty(),
+                                        "short remainder lost composition");
+                                stageStart = Clock::now();
+                                stage = 1;
+                            } else if (stage == 1 &&
+                                       stageElapsed >
+                                           std::chrono::milliseconds(900)) {
+                                require(state()->pinyin.empty() &&
+                                            (!state()->debounce ||
+                                             !state()->debounce->isEnabled()) &&
+                                            state()->requestSeq == 0,
+                                        "a one-letter remainder started a "
+                                        "request");
+                                ic->reset();
                                 finish(true, "");
                             }
                         } else if (appeared) {

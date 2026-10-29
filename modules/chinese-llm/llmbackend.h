@@ -110,10 +110,9 @@ bool isAllHan(std::string_view text);
 
 /// Whether a string looks like plain pinyin keys, i.e. only a-z, ' and space.
 ///
-/// The pinyin engine renders the partially selected preedit as a mix of Han
-/// characters and pinyin ("你好 ni hao"). We only take over when nothing has
-/// been selected yet, and this predicate is how that is decided: it is the one
-/// property we can check exactly through the public API.
+/// After a partial selection the pinyin engine renders the preedit as a mix of
+/// Han characters and pinyin ("你好 ni hao"). The caller splits that mix using
+/// the engine's own composition and applies this predicate to the pinyin part.
 bool isPlainPinyin(std::string_view text);
 
 /// Why a user-chosen marker symbol cannot be used.

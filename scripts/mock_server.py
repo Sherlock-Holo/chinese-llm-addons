@@ -27,6 +27,8 @@ REPLIES = {
     "nhsj": ["你换手机"],
     "ceshi": ["测试"],
     "shui": ["谁"],
+    # The rest of "tamenzhengzaikaihui" once "他们" has been accepted.
+    "zheng'zai'kai'hui": ["争在开会"],
 }
 # Keep semantic candidate bytes independent of how the native engine segments
 # a foreign word such as "push" in its raw pinyin preedit.

@@ -411,10 +411,20 @@ and is conservatively treated as an echo, not an exception to validation. The
 validator cannot establish semantic correctness or guarantee that a nonidentical
 English result is not a model explanation; keep prompts limited to candidate text.
 
-Partial selections and immutable stroke/action-filtered candidate lists suppress
-the model path. Raw server preedit is preferred over Chinese client commit-preview
-text. Request eligibility still requires ASCII letter keys; accepting English,
-digits and emoji **output** does not change the native engine's key handling.
+Immutable stroke/action-filtered candidate lists suppress the model path.
+Request eligibility still requires ASCII letter keys; accepting English, digits
+and emoji **output** does not change the native engine's key handling.
+
+Partial selections keep working. When you accept the first words of a long
+sentence and keep typing the rest, the model is asked only about the pinyin that
+is still unselected, and only up to the cursor, which is exactly what the
+dictionary candidates on screen are for. That is what makes the agreement mark
+meaningful there too. The words you already accepted are added to the end of the
+context sent to the model (they are not in the application's text yet).
+Choosing a model candidate commits the accepted words and the model's text
+together, so the first half of the sentence is never lost. A remainder shorter
+than `MinPinyinLength` sends nothing. The composition is read from the private
+engine, not parsed from the preedit, which mixes hanzi and pinyin at that point.
 
 A timeout, dead endpoint, non-200 response or malformed JSON simply yields no
 model suggestions; native candidates remain. Repeated errors enter a cooldown

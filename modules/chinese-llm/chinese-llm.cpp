@@ -114,11 +114,12 @@ constexpr uint64_t kSnapshotDelayUs = 300 * 1000;
  */
 class LlmCandidateWord : public fcitx::CandidateWord {
 public:
-    LlmCandidateWord(std::string text, const std::string &badge,
+    LlmCandidateWord(std::string text, std::string prefix,
+                     const std::string &badge,
                      std::function<bool(fcitx::InputContext *)> valid,
                      std::function<void()> adopted)
-        : text_(std::move(text)), valid_(std::move(valid)),
-          adopted_(std::move(adopted)) {
+        : text_(std::move(text)), prefix_(std::move(prefix)),
+          valid_(std::move(valid)), adopted_(std::move(adopted)) {
         setText(fcitx::Text(text_));
         if (!badge.empty()) {
             setComment(fcitx::Text(badge));
@@ -130,7 +131,9 @@ public:
         if (!valid_(inputContext)) {
             return;
         }
-        inputContext->commitString(text_);
+        // Hanzi accepted earlier in this composition were never committed; only
+        // this reset would throw them away, so they go out in front.
+        inputContext->commitString(prefix_ + text_);
         if (adopted_) {
             adopted_();
         }
@@ -140,6 +143,7 @@ public:
 
 private:
     std::string text_;
+    std::string prefix_;
     std::function<bool(fcitx::InputContext *)> valid_;
     std::function<void()> adopted_;
 };
@@ -278,7 +282,8 @@ ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
             if (!isLlmInputMethod(ic) ||
                 ic->capabilityFlags().testAny(
                     CapabilityFlag::PasswordOrSensitive) ||
-                state->pinyin.empty() || buildContext(ic) == state->context) {
+                state->pinyin.empty() ||
+                buildContext(ic, state->selected) == state->context) {
                 return;
             }
             invalidateState(ic, state, false, "surrounding_context_changed");
@@ -302,6 +307,7 @@ ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
                     &factory_);
             if (state->pinyin.empty()) {
                 state->commitHistoryId = 0;
+                state->commitSelected.clear();
             }
         }));
     eventWatchers_.emplace_back(instance_->watchEvent(
@@ -317,11 +323,20 @@ ChineseLlm::ChineseLlm(fcitx::AddonManager *manager)
             auto *state = ic->propertyFor(&factory_);
             const auto id =
                 state->historyId ? state->historyId : state->commitHistoryId;
+            // The engine commits the whole sentence, accepted hanzi included;
+            // the request was only about what came after them.
+            const auto &selected =
+                state->historyId ? state->selected : state->commitSelected;
+            std::string_view text = commit.text();
+            if (text.starts_with(selected)) {
+                text.remove_prefix(selected.size());
+            }
             if (history_.adoptable(id)) {
-                history_.adopt(id, commit.text(), true);
+                history_.adopt(id, std::string(text), true);
                 refreshHistory();
             }
             state->commitHistoryId = 0;
+            state->commitSelected.clear();
         }));
 
     worker_->start();
@@ -586,47 +601,87 @@ bool ChineseLlm::isEligible(fcitx::InputContext *ic) {
     return true;
 }
 
-std::string ChineseLlm::buildContext(fcitx::InputContext *ic) const {
+std::string ChineseLlm::buildContext(fcitx::InputContext *ic,
+                                     const std::string &selected) const {
     const int limit = config_.contextLength.value();
     if (limit <= 0) {
         return {};
     }
+    std::string text;
     const auto &surrounding = ic->surroundingText();
-    if (!surrounding.isValid()) {
-        // Many clients cannot provide surrounding text. Degrading to an empty
-        // context is correct: the model still works, just less well.
-        return {};
+    // Many clients cannot provide surrounding text. Degrading to what the
+    // user accepted in this composition (possibly nothing) is correct: the
+    // model still works, just less well.
+    if (surrounding.isValid()) {
+        const std::string &all = surrounding.text();
+        const unsigned int cursor = surrounding.cursor();
+        const size_t length = fcitx::utf8::lengthValidated(all);
+        if (length != fcitx::utf8::INVALID_LENGTH && cursor != 0 &&
+            cursor <= length) {
+            const size_t usable =
+                std::min<size_t>(cursor, static_cast<size_t>(limit));
+            const auto start = utf8::nextNChar(all.begin(), cursor - usable);
+            const auto end = utf8::nextNChar(all.begin(), cursor);
+            text.assign(start, end);
+        }
     }
-    const std::string &text = surrounding.text();
-    const unsigned int cursor = surrounding.cursor();
+    // Accepted hanzi are not in the client's text yet but come right before
+    // what is being typed.
+    text += selected;
     const size_t length = fcitx::utf8::lengthValidated(text);
-    if (length == fcitx::utf8::INVALID_LENGTH || cursor == 0 ||
-        cursor > length) {
+    if (length == fcitx::utf8::INVALID_LENGTH) {
         return {};
     }
-    const size_t usable = std::min<size_t>(cursor, static_cast<size_t>(limit));
-    const auto start = utf8::nextNChar(text.begin(), cursor - usable);
-    const auto end = utf8::nextNChar(text.begin(), cursor);
-    return std::string(start, end);
+    if (length > static_cast<size_t>(limit)) {
+        text.erase(0, std::distance(text.begin(),
+                                    utf8::nextNChar(text.begin(),
+                                                    length - limit)));
+    }
+    return text;
 }
 
-std::string ChineseLlm::currentPinyin(fcitx::InputContext *ic) const {
-    // CommitPreview uses Han client preedit alongside raw server preedit.
-    // Prefer the server field when present; both are mixed after partial
-    // selection.
-    auto preedit = ic->inputPanel().preedit().toString();
-    if (preedit.empty()) {
-        preedit = ic->inputPanel().clientPreedit().toString();
-    }
-    if (!isPlainPinyin(preedit)) {
+Composition ChineseLlm::currentComposition(fcitx::InputContext *ic) const {
+    // The private engine is the source of truth. The panel's preedit mixes the
+    // accepted hanzi and the remaining pinyin after a partial selection, so
+    // the composition is read directly and split at the accepted hanzi.
+    auto *engine = static_cast<llmnative::PinyinEngine *>(pinyin_.get());
+    auto *engineState = ic->propertyFor(&engine->factory());
+    if (engineState->mode_ != llmnative::PinyinMode::Normal) {
         return {};
     }
-    std::replace(preedit.begin(), preedit.end(), ' ', '\'');
-    if (preedit.size() > MAX_PINYIN_LENGTH ||
-        static_cast<int>(preedit.size()) < config_.minPinyinLength.value()) {
+    const auto &composition = engineState->context_;
+    if (composition.selectedLength() >= composition.size()) {
         return {};
     }
-    return preedit;
+    // Same text the panel shows (syllables separated), which is what the
+    // length policy and the prompt are written for.
+    auto [preedit, cursor] = composition.preeditWithCursor();
+    std::string selected = composition.selectedSentence();
+    if (!preedit.starts_with(selected)) {
+        return {};
+    }
+    // Native candidates are built for the pinyin before the cursor (all of it
+    // when the cursor is not inside the unselected part), so the comparison has
+    // to be too.
+    std::string pinyin = preedit.substr(
+        selected.size(),
+        cursor > selected.size() ? cursor - selected.size() : std::string::npos);
+    // The engine may put a separator between the hanzi and the pinyin.
+    const auto first = pinyin.find_first_not_of(" '");
+    const auto last = pinyin.find_last_not_of(" '");
+    if (first == std::string::npos) {
+        return {};
+    }
+    pinyin = pinyin.substr(first, last - first + 1);
+    if (!isPlainPinyin(pinyin)) {
+        return {};
+    }
+    std::replace(pinyin.begin(), pinyin.end(), ' ', '\'');
+    if (pinyin.size() > MAX_PINYIN_LENGTH ||
+        static_cast<int>(pinyin.size()) < config_.minPinyinLength.value()) {
+        return {};
+    }
+    return {std::move(pinyin), std::move(selected)};
 }
 
 std::string ChineseLlm::cacheKey(const std::string &pinyin,
@@ -664,8 +719,10 @@ void ChineseLlm::invalidateState(fcitx::InputContext *ic, LlmState *state,
                                  bool preserveCommit, std::string_view reason) {
     if (preserveCommit && state->historyId) {
         state->commitHistoryId = state->historyId;
+        state->commitSelected = state->selected;
     } else if (!preserveCommit) {
         state->commitHistoryId = 0;
+        state->commitSelected.clear();
     }
     if (state->historyId) {
         history_.markCancelled(state->historyId, std::string(reason));
@@ -680,6 +737,7 @@ void ChineseLlm::invalidateState(fcitx::InputContext *ic, LlmState *state,
     state->requestSeq = 0;
     state->pinyin.clear();
     state->context.clear();
+    state->selected.clear();
     state->candidates.clear();
     removeCandidates(ic, state);
 }
@@ -719,14 +777,15 @@ void ChineseLlm::handleUpdateUI(fcitx::Event &event) {
         invalidateState(ic, state, emptyOwnComposition, "input_not_eligible");
         return;
     }
-    auto pinyin = currentPinyin(ic);
+    auto [pinyin, selected] = currentComposition(ic);
     if (pinyin.empty()) {
         invalidateState(ic, state, emptyOwnComposition,
                         "input_not_plain_pinyin");
         return;
     }
-    auto context = buildContext(ic);
-    if (state->pinyin == pinyin && state->context == context) {
+    auto context = buildContext(ic, selected);
+    if (state->pinyin == pinyin && state->context == context &&
+        state->selected == selected) {
         // The engine can rebuild the list without changing the composition,
         // for example when paging or moving its cursor.
         insertCandidates(ic, state, state->candidates);
@@ -735,6 +794,7 @@ void ChineseLlm::handleUpdateUI(fcitx::Event &event) {
     invalidateState(ic, state, false, "input_keys_or_context_changed");
     state->pinyin = pinyin;
     state->context = context;
+    state->selected = selected;
 
     const auto key = cacheKey(pinyin, context);
     if (const auto iter = cache_.find(key); iter != cache_.end()) {
@@ -751,15 +811,17 @@ void ChineseLlm::handleUpdateUI(fcitx::Event &event) {
         return;
     }
 
-    scheduleRequest(ic, state, std::move(pinyin), std::move(context));
+    scheduleRequest(ic, state, std::move(pinyin), std::move(context),
+                    std::move(selected));
 }
 
 void ChineseLlm::scheduleRequest(fcitx::InputContext *ic, LlmState *state,
-                                 std::string pinyin, std::string context) {
+                                 std::string pinyin, std::string context,
+                                 std::string selected) {
     const int debounce = config_.debounceMs.value();
     if (debounce <= 0) {
         dispatchRequest(ic, state, std::move(pinyin), std::move(context),
-                        state->generation);
+                        std::move(selected), state->generation);
         return;
     }
 
@@ -774,15 +836,17 @@ void ChineseLlm::scheduleRequest(fcitx::InputContext *ic, LlmState *state,
         1000,
         [this, owner = watch(), ref = ic->watch(),
          generation = state->generation, pinyin = std::move(pinyin),
-         context = std::move(context)](fcitx::EventSourceTime *,
-                                       uint64_t) mutable {
+         context = std::move(context),
+         selected = std::move(selected)](fcitx::EventSourceTime *,
+                                         uint64_t) mutable {
             auto *inputContext = ref.get();
             if (!owner.isValid() || !inputContext) {
                 return true;
             }
             auto *cur = inputContext->propertyFor(&factory_);
             dispatchRequest(inputContext, cur, std::move(pinyin),
-                            std::move(context), generation);
+                            std::move(context), std::move(selected),
+                            generation);
             return true;
         });
     state->debounce->setOneShot();
@@ -790,16 +854,21 @@ void ChineseLlm::scheduleRequest(fcitx::InputContext *ic, LlmState *state,
 
 bool ChineseLlm::matchesInput(fcitx::InputContext *ic,
                               const InputSnapshot &snapshot) {
-    return isEligible(ic) &&
-           ic->propertyFor(&factory_)->generation == snapshot.generation &&
-           currentPinyin(ic) == snapshot.pinyin &&
-           buildContext(ic) == snapshot.context;
+    if (!isEligible(ic) ||
+        ic->propertyFor(&factory_)->generation != snapshot.generation) {
+        return false;
+    }
+    const auto composition = currentComposition(ic);
+    return composition.pinyin == snapshot.pinyin &&
+           composition.selected == snapshot.selected &&
+           buildContext(ic, composition.selected) == snapshot.context;
 }
 
 void ChineseLlm::dispatchRequest(fcitx::InputContext *ic, LlmState *state,
                                  std::string pinyin, std::string context,
-                                 uint64_t generation) {
-    InputSnapshot snapshot{generation, std::move(pinyin), std::move(context)};
+                                 std::string selected, uint64_t generation) {
+    InputSnapshot snapshot{generation, std::move(pinyin), std::move(context),
+                           std::move(selected)};
     if (state->generation != generation || !matchesInput(ic, snapshot)) {
         return;
     }
@@ -993,7 +1062,7 @@ void ChineseLlm::insertCandidates(fcitx::InputContext *ic, LlmState *state,
     const auto valid =
         [owner = watch(), ref = ic->watch(),
          snapshot = InputSnapshot{state->generation, state->pinyin,
-                                  state->context}](InputContext *selectedIc) {
+                                  state->context, state->selected}](InputContext *selectedIc) {
             auto *self = owner.get();
             auto *ic = ref.get();
             return self && ic && selectedIc == ic &&
@@ -1012,7 +1081,8 @@ void ChineseLlm::insertCandidates(fcitx::InputContext *ic, LlmState *state,
         };
         modifiable->insert(position,
                            std::make_unique<LlmCandidateWord>(
-                               toInsert[i], badge, valid, std::move(adopted)));
+                               toInsert[i], state->selected, badge, valid,
+                               std::move(adopted)));
     }
     ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
     state->inserting = false;
@@ -1088,6 +1158,7 @@ void ChineseLlm::clearHistory() {
         auto *state = ic->propertyFor(&factory_);
         state->historyId = 0;
         state->commitHistoryId = 0;
+        state->commitSelected.clear();
         return true;
     });
     refreshHistory();

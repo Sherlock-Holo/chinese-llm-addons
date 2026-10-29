@@ -198,6 +198,21 @@ struct InputSnapshot {
     uint64_t generation = 0;
     std::string pinyin;
     std::string context;
+    /// Hanzi the user already accepted in this composition. They are not in the
+    /// client's surrounding text yet, and they must be committed in front of
+    /// whatever the model candidate says.
+    std::string selected;
+};
+
+/// What the native engine is composing right now, split at the point where the
+/// user stopped accepting words.
+struct Composition {
+    /// Unselected pinyin up to the cursor: the part the native candidates are
+    /// for, and therefore the part the model is asked about. Empty when this
+    /// is not plain pinyin.
+    std::string pinyin;
+    /// Hanzi already accepted from the front of the composition.
+    std::string selected;
 };
 
 /// Per input context state. The candidate list is rebuilt from scratch on
@@ -206,11 +221,14 @@ struct LlmState : public fcitx::InputContextProperty {
     /// Composition and context associated with the current request/results.
     std::string pinyin;
     std::string context;
+    std::string selected;
     std::vector<std::string> candidates;
     uint64_t requestSeq = 0;
     uint64_t historyId = 0;
     // Native commits may be delivered after the engine's composition reset.
     uint64_t commitHistoryId = 0;
+    /// The accepted hanzi that belong to commitHistoryId's commit.
+    std::string commitSelected;
     /// Pending debounce timer, reset on every keystroke.
     std::unique_ptr<fcitx::EventSourceTime> debounce;
     /// Guards against re-entering our own UI update. Inserting a candidate and
@@ -304,7 +322,9 @@ private:
     void handleFetch(fcitx::InputContext *ic, const InputSnapshot &snapshot,
                      uint64_t historyId, FetchStage stage,
                      const FetchResult &result);
-    std::string currentPinyin(fcitx::InputContext *ic) const;
+    /// Reads the private native engine's composition directly. The preedit is
+    /// no use for this: after a partial selection it is hanzi and pinyin mixed.
+    Composition currentComposition(fcitx::InputContext *ic) const;
     static std::string cacheKey(const std::string &pinyin,
                                 const std::string &context);
 
@@ -312,15 +332,18 @@ private:
     /// Whether this input context is one we should generate candidates for.
     /// Not const: an expired cooldown is cleared as a side effect of asking.
     bool isEligible(fcitx::InputContext *ic);
-    /// Recently committed text before the cursor, at most ContextLength chars.
-    std::string buildContext(fcitx::InputContext *ic) const;
+    /// Recently committed text before the cursor followed by the hanzi already
+    /// accepted in this composition, at most ContextLength chars.
+    std::string buildContext(fcitx::InputContext *ic,
+                             const std::string &selected) const;
     /// Schedule a request for the given pinyin after the debounce delay.
     void scheduleRequest(fcitx::InputContext *ic, LlmState *state,
-                         std::string pinyin, std::string context);
+                         std::string pinyin, std::string context,
+                         std::string selected);
     /// Actually hand the request to the worker.
     void dispatchRequest(fcitx::InputContext *ic, LlmState *state,
                          std::string pinyin, std::string context,
-                         uint64_t generation);
+                         std::string selected, uint64_t generation);
     /// Insert the given candidates at the configured position.
     void insertCandidates(fcitx::InputContext *ic, LlmState *state,
                           const std::vector<std::string> &candidates);

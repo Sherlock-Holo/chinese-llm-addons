@@ -122,7 +122,7 @@ run_checked config 'All config tests passed' "$RUN_DIR/config.log" "$BUILD_DIR/b
 run_checked worker 'All worker tests passed' "$RUN_DIR/worker.log" \
     "$BUILD_DIR/bin/testllmworker" "$BASE/v1/chat/completions"
 
-for scenario in live mixed mixed-context-changed cache sensitive dead toggle history-menu stats-overlap llm-alone; do
+for scenario in live mixed mixed-context-changed cache sensitive dead toggle history-menu stats-overlap llm-alone partial; do
     scenario_dir="$RUN_DIR/$scenario"
     mkdir -p "$scenario_dir"/{config/conf,data,cache,runtime}
     chmod 700 "$scenario_dir/runtime"
@@ -249,7 +249,7 @@ stats = json.load(open(sys.argv[2]))
 count = stats["count"]
 expected = {"live": 1, "mixed": 1, "mixed-context-changed": 1, "cache": 2,
             "sensitive": 0, "dead": 0, "toggle": 0, "history-menu": 1,
-            "stats-overlap": 1, "llm-alone": 1}
+            "stats-overlap": 1, "llm-alone": 1, "partial": 1}
 assert scenario in expected, f"missing request-count assertion for {scenario}"
 assert count == expected[scenario], f"{scenario}: expected {expected[scenario]} POSTs, got {count}"
 if scenario == "mixed":
@@ -257,6 +257,10 @@ if scenario == "mixed":
     assert record["path"] == "/mixed/v1/chat/completions", f"{scenario}: wrong payload fixture"
     assert "'" in record["pinyin"], f"{scenario}: must exercise separated pinyin length policy"
     assert record["authorization"] == "", f"{scenario}: leaked host API key to mock"
+if scenario == "partial":
+    record = stats["requests"][0]
+    assert record["pinyin"].replace("'", "") == "zhengzaikaihui", f"{scenario}: request was not for the remaining pinyin: {record['pinyin']}"
+    assert record["user"].splitlines()[0] == "丁戊他们", f"{scenario}: accepted words missing from context: {record['user']!r}"
 if scenario == "mixed-context-changed":
     record = stats["requests"][0]
     normalized = record["pinyin"].replace("'", "").replace(" ", "").lower()
