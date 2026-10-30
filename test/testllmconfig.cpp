@@ -16,6 +16,7 @@
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <vector>
 
 int main(int argc, char *argv[]) {
     using fcitx::chinesellm::ChineseLlmConfig;
@@ -102,6 +103,7 @@ int main(int argc, char *argv[]) {
         {"MaxCandidates", "Integer"},
         {"CandidateIndex", "Integer"},
         {"ContextLength", "Integer"},
+        {"EnglishPolicy", "Enum"},
         {"CacheSize", "Integer"},
         {"MaxConsecutiveErrors", "Integer"},
         {"CooldownSeconds", "Integer"},
@@ -126,6 +128,8 @@ int main(int argc, char *argv[]) {
         {"CandidateIndex", {"Candidate Position", "候选词插入位置"}},
         {"ContextLength",
          {"Context Length (characters)", "上下文长度（字符）"}},
+        {"EnglishPolicy",
+         {"English in LLM candidates", "LLM 候选词中的英文"}},
         {"CacheSize", {"Cache Size", "缓存条目数"}},
         {"MaxConsecutiveErrors",
          {"Errors Before Cooldown", "进入冷却前的连续错误次数"}},
@@ -146,6 +150,10 @@ int main(int argc, char *argv[]) {
         {"ShowBadge", "在 LLM "
                       "生成的候选词旁显示云朵符号，符号不会输入到正文。词库候选"
                       "词不会标记，包括与模型结果重复的词库候选词。"},
+        {"EnglishPolicy",
+         "模型结果含有英文字母时的处理方式。“完全扔掉”会丢弃整条结果；“去掉头尾"
+         "英文”会去掉结果开头和结尾的英文并保留其余部分，中间的英文保留。数字、"
+         "标点和 emoji 不算英文。"},
         {"Endpoint", "兼容 OpenAI 的聊天补全接口地址，支持 Ollama、llama.cpp "
                      "的 llama-server 以及兼容的在线 API。"},
         {"ApiKey", "以 Bearer "
@@ -160,7 +168,7 @@ int main(int argc, char *argv[]) {
         {"PromptTemplate", "{context} 会替换为最近输入并确认的文本，{pinyin} "
                            "会替换为正在输入的拼音。"}};
     if (!root || root->subItemsSize() != expected.size()) {
-        std::cerr << "root GUI description does not expose 22 independent "
+        std::cerr << "root GUI description does not expose 23 independent "
                      "settings/link fields\n";
         return 1;
     }
@@ -176,6 +184,20 @@ int main(int argc, char *argv[]) {
         }
     }
     if (localized) {
+        const std::vector<std::string> zhChoices{"保留英文", "完全扔掉",
+                                                 "去掉头尾英文"};
+        const std::vector<std::string> enChoices{
+            "Keep English", "Discard the whole result",
+            "Strip English at the ends"};
+        for (size_t i = 0; i < zhChoices.size(); ++i) {
+            const auto *choice = description.valueByPath(
+                rootType + "/EnglishPolicy/EnumI18n/" + std::to_string(i));
+            if (!choice || *choice != (chinese ? zhChoices[i] : enChoices[i])) {
+                std::cerr << "wrong EnglishPolicy drop-down entry " << i
+                          << '\n';
+                return 1;
+            }
+        }
         for (const auto &[field, translations] : labels) {
             const auto *label = description.valueByPath(rootType + '/' + field +
                                                         "/Description");

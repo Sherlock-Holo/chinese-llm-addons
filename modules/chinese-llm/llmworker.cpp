@@ -257,7 +257,8 @@ void LlmWorker::run() {
             }
             if (complete) {
                 auto sanitized =
-                    sanitizeDetailed(result.content, result.pinyin, 0);
+                    sanitizeDetailed(result.content, result.pinyin, 0,
+                                     job->config.englishPolicy);
                 // Preserve a transport rejection (e.g. byte cap) even if the
                 // buffered prefix happens to contain a parseable completion.
                 for (auto &rejected : sanitized.rejected) {

@@ -7,6 +7,7 @@
 #define _CHINESE_LLM_LLMBACKEND_H_
 
 #include <cstddef>
+#include <fcitx-config/enum.h>
 #include <fcitx-config/rawconfig.h>
 #include <string>
 #include <string_view>
@@ -24,6 +25,10 @@ constexpr size_t MAX_RESPONSE_BYTES = 64 * 1024;
 /// 40 keys; anything beyond that is a paste or a stuck key, not typing.
 constexpr size_t MAX_PINYIN_LENGTH = 40;
 
+/// What to do with model output that contains Latin letters. The names are the
+/// values stored in the configuration file.
+FCITX_CONFIG_ENUM(EnglishPolicy, Keep, Discard, StripEdges)
+
 struct BackendConfig {
     std::string endpoint;
     std::string model;
@@ -33,6 +38,7 @@ struct BackendConfig {
     double temperature = 0.0;
     int maxTokens = 64;
     int timeoutSeconds = 5;
+    EnglishPolicy englishPolicy = EnglishPolicy::Keep;
 };
 
 struct RequestSpec {
@@ -72,14 +78,24 @@ struct SanitizedCandidates {
 };
 
 /// Sanitize with bounded per-line diagnostics. Rejection reasons are fixed codes:
-/// invalid_text, empty_or_punctuation, han_length_mismatch, key_echo and
-/// response_too_large. At most 32 rejected lines are retained, each at most 1024
+/// invalid_text, empty_or_punctuation, english_disabled, han_length_mismatch,
+/// key_echo and response_too_large. At most 32 rejected lines are retained, each at most 1024
 /// bytes of UTF-8-safe text (invalid bytes and controls use readable escapes).
 /// Empty/ordinary-ASCII-space-only lines are skipped, not reported as rejects.
 /// Candidate limits do not prevent recording rejected lines later in the reply.
+///
+/// englishPolicy decides what happens to a line with a Latin letter: Keep
+/// accepts it, Discard rejects the whole line as english_disabled, and
+/// StripEdges removes the English at the start and the end of the line and
+/// keeps the rest (a line with nothing left is english_disabled). English in
+/// the middle of a line is kept, and a stripped line is no longer held to the
+/// one-Han-per-syllable rule because the removed English took keys with it.
+/// Digits, punctuation and emoji are not English.
 SanitizedCandidates sanitizeDetailed(std::string_view content,
                                      std::string_view pinyin,
-                                     size_t maxCandidates);
+                                     size_t maxCandidates,
+                                     EnglishPolicy englishPolicy =
+                                         EnglishPolicy::Keep);
 
 /// Turn raw model output into candidates that are safe to commit.
 ///
@@ -94,9 +110,12 @@ SanitizedCandidates sanitizeDetailed(std::string_view content,
 /// @param content raw model output (bounded by MAX_RESPONSE_BYTES)
 /// @param pinyin request keys, used for pure-Han length and exact echo checks
 /// @param maxCandidates upper bound on returned candidates, 0 means no limit
+/// @param englishPolicy how to treat Latin letters, see sanitizeDetailed()
 std::vector<std::string> sanitize(std::string_view content,
                                   std::string_view pinyin,
-                                  size_t maxCandidates);
+                                  size_t maxCandidates,
+                                  EnglishPolicy englishPolicy =
+                                      EnglishPolicy::Keep);
 
 /// Count the syllables of a pinyin string as separated by ' or space.
 ///

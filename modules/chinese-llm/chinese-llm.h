@@ -37,6 +37,29 @@
 
 namespace fcitx::chinesellm {
 
+/// Drop-down for EnglishPolicy. The file stores Keep/Discard/StripEdges; the
+/// page shows translated labels and an explanation.
+struct EnglishPolicyAnnotation {
+    bool skipDescription() const { return false; }
+    bool skipSave() const { return false; }
+    void dumpDescription(fcitx::RawConfig &config) const {
+        config.setValueByPath("EnumI18n/0",
+                              D_("chinese-llm", "Keep English"));
+        config.setValueByPath("EnumI18n/1",
+                              D_("chinese-llm", "Discard the whole result"));
+        config.setValueByPath(
+            "EnumI18n/2", D_("chinese-llm", "Strip English at the ends"));
+        config.setValueByPath(
+            "Tooltip",
+            D_("chinese-llm",
+               "What to do with a model result that contains English "
+               "letters. \"Discard\" drops the whole result. \"Strip\" "
+               "removes English at the start and end of the result and "
+               "keeps the rest; English in the middle stays. Digits, "
+               "punctuation and emoji are never treated as English."));
+    }
+};
+
 FCITX_CONFIGURATION(
     ChineseLlmConfig,
     fcitx::SubConfigOption nativePinyin{
@@ -96,6 +119,15 @@ FCITX_CONFIGURATION(
     fcitx::Option<int, fcitx::IntConstrain> contextLength{
         this, "ContextLength", D_("chinese-llm", "Context Length (characters)"),
         64, fcitx::IntConstrain(0, 256)};
+    fcitx::OptionWithAnnotation<EnglishPolicy, EnglishPolicyAnnotation>
+        englishPolicy{
+            this,
+            "EnglishPolicy",
+            D_("chinese-llm", "English in LLM candidates"),
+            EnglishPolicy::Keep,
+            {},
+            {},
+            {}};
     fcitx::Option<int, fcitx::IntConstrain> cacheSize{
         this, "CacheSize", D_("chinese-llm", "Cache Size"), 256,
         fcitx::IntConstrain(0, 4096)};

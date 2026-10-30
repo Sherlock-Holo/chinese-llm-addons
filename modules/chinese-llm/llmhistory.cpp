@@ -444,6 +444,7 @@ std::string reasonLabel(const Page &t, const std::string &code) {
         {"empty_or_punctuation", "为空或只有标点", "Empty or punctuation only"},
         {"markup", "含标记、列表或说明", "Markup, list or narration"},
         {"too_long", "比拼音长得多", "Much longer than the pinyin"},
+        {"english_disabled", "已关闭英文候选词", "English candidates are off"},
         {"han_length_mismatch", "汉字数与拼音不符", "Han length does not match"},
         {"key_echo", "只是回显了按键", "Merely echoes the keys"},
     };

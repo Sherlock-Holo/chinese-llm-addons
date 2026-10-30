@@ -562,6 +562,7 @@ BackendConfig ChineseLlm::backendConfig() const {
     }
     backend.systemPrompt = config_.systemPrompt.value();
     backend.promptTemplate = config_.promptTemplate.value();
+    backend.englishPolicy = config_.englishPolicy.value();
     backend.maxTokens = 64;
     backend.temperature = 0.0;
     backend.timeoutSeconds = config_.timeoutSeconds.value();

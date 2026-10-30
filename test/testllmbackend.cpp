@@ -238,6 +238,60 @@ void testSanitizeMixed() {
     }
 }
 
+void testSanitizeEnglishPolicy() {
+    const char *keys = "bang'wo'push'yi'xia";
+    const auto discard = EnglishPolicy::Discard;
+    const auto strip = EnglishPolicy::StripEdges;
+    checkCandidates(
+        sanitize("帮我push一下\n帮我推一下\nHello\ncafé", keys, 5, discard),
+        {"帮我推一下"}, "Discard keeps only Latin-free lines");
+    checkCandidates(
+        sanitize("2026\n版本2.0发布!\n😀\n你好，。", "ban'ben", 5, discard),
+        {"2026", "版本2.0发布!", "😀", "你好"},
+        "Discard still allows digits, punctuation and emoji");
+    checkCandidates(sanitize("cafe\u0301", "ka'fei", 3, discard), {},
+                    "Discard rejects decomposed Latin accents");
+    checkCandidates(sanitize("帮我push一下", keys, 3, EnglishPolicy::Keep),
+                    {"帮我push一下"}, "Keep is the unchanged default");
+    checkCandidates(sanitize("帮我push一下", keys, 3), {"帮我push一下"},
+                    "Keep is the default argument");
+
+    const char *long_keys = "ni'hao'ma'wo'shi'xiao'ming";
+    checkCandidates(sanitize("Hello 你好吗", long_keys, 3, strip), {"你好吗"},
+                    "Strip removes a leading English word");
+    checkCandidates(sanitize("你好吗 thanks!", long_keys, 3, strip), {"你好吗"},
+                    "Strip removes a trailing English word and its punctuation");
+    checkCandidates(sanitize("OK, 你好吗, thanks!", long_keys, 3, strip),
+                    {"你好吗"}, "Strip removes English at both ends");
+    checkCandidates(sanitize("你好hello吗", long_keys, 3, strip),
+                    {"你好hello吗"}, "Strip keeps English in the middle");
+    checkCandidates(sanitize("hello", "ni'hao", 3, strip), {},
+                    "Strip leaves nothing of a pure English line");
+    checkCandidates(sanitize("Hello World", "ni'hao", 3, strip), {},
+                    "Strip leaves nothing of several English words");
+    checkCandidates(sanitize("你好吗", "ni'hao'ma", 3, strip), {"你好吗"},
+                    "Strip leaves a line without English untouched");
+    checkCandidates(sanitize("Hello 2026", "ni'hao", 3, strip), {"2026"},
+                    "Strip keeps digits next to English");
+    checkCandidates(sanitize("**帮我** push", keys, 3, strip), {"帮我"},
+                    "Strip unwraps emphasis before looking at the edges");
+    checkCandidates(sanitize("帮我push一下\n帮我推一下", keys, 5, strip),
+                    {"帮我push一下", "帮我推一下"},
+                    "Strip decides line by line");
+    checkCandidates(sanitize("Hello 你好吗\n你好吗", long_keys, 5, strip),
+                    {"你好吗"}, "Strip deduplicates stripped lines");
+
+    const auto detailed = sanitizeDetailed("Hello\n你好", "ni'hao", 0, discard);
+    check(detailed.rejected.size() == 1 &&
+              detailed.rejected[0].reason == "english_disabled" &&
+              detailed.rejected[0].text == "Hello",
+          "Discard reports english_disabled");
+    const auto stripped = sanitizeDetailed("Hello", "ni'hao", 0, strip);
+    check(stripped.rejected.size() == 1 &&
+              stripped.rejected[0].reason == "english_disabled",
+          "Strip reports english_disabled when nothing is left");
+}
+
 // Chat models narrate. Now that Latin text is legitimate, narration must not
 // become candidates.
 void testSanitizeNarration() {
@@ -395,6 +449,7 @@ int main() {
     testPredicates();
     testSanitizeHan();
     testSanitizeMixed();
+    testSanitizeEnglishPolicy();
     testSanitizeNarration();
     testSanitizeUnsafe();
     testSanitizeDetailed();

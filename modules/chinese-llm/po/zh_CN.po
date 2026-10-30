@@ -51,6 +51,21 @@ msgstr "候选词插入位置"
 msgid "Context Length (characters)"
 msgstr "上下文长度（字符）"
 
+msgid "English in LLM candidates"
+msgstr "LLM 候选词中的英文"
+
+msgid "Keep English"
+msgstr "保留英文"
+
+msgid "Discard the whole result"
+msgstr "完全扔掉"
+
+msgid "Strip English at the ends"
+msgstr "去掉头尾英文"
+
+msgid "What to do with a model result that contains English letters. \"Discard\" drops the whole result. \"Strip\" removes English at the start and end of the result and keeps the rest; English in the middle stays. Digits, punctuation and emoji are never treated as English."
+msgstr "模型结果含有英文字母时的处理方式。“完全扔掉”会丢弃整条结果；“去掉头尾英文”会去掉结果开头和结尾的英文并保留其余部分，中间的英文保留。数字、标点和 emoji 不算英文。"
+
 msgid "Cache Size"
 msgstr "缓存条目数"
 

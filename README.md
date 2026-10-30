@@ -362,6 +362,14 @@ connection-test button, automatic model listing or model-service startup yet.
 - `MinPinyinLength=4`, `DebounceMs=250`, `TimeoutSeconds=5`.
 - `MaxCandidates=3`, `CandidateIndex=2` (1-based), `ShowBadge=True`, `ShowOverlapBadge=True`, `BadgeSymbol=☁︎`, `OverlapSymbol=⚙︎`.
 - `ContextLength=64` (0 disables surrounding-text use), `CacheSize=256`.
+- `EnglishPolicy=Keep`: a drop-down for model results that contain Latin letters.
+  `Keep` accepts them; `Discard` drops the whole result; `StripEdges` removes the
+  English at the start and end of the result and keeps the rest (`Hello 你好吗,
+  thanks!` becomes `你好吗`; English in the middle stays). A result with nothing
+  left, and every dropped one, shows as `english_disabled` in the history page.
+  A stripped result is no longer held to the one-Han-per-syllable rule, because
+  the removed English took keys with it. Digits, punctuation and emoji are never
+  English. Changing the setting clears cached results.
 - `MaxConsecutiveErrors=5`, `CooldownSeconds=120`.
 - `ToggleKey=Control+Alt+Shift+L`: only intercepted in LLM拼音.
 - `SystemPrompt`: request candidate text only, preserving appropriate English,

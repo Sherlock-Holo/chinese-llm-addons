@@ -11,6 +11,8 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace fcitx::chinesellm {
 
@@ -222,6 +224,7 @@ bool isCandidatePunct(uint32_t c) {
 struct CandidateText {
     size_t hanCount = 0;
     bool hasOtherContent = false; // Latin letters, digits or visible emoji.
+    bool hasLatin = false;        // Latin letters, a subset of the above.
 };
 
 std::optional<CandidateText> validateCandidate(std::string_view text) {
@@ -278,6 +281,7 @@ std::optional<CandidateText> validateCandidate(std::string_view text) {
             latinCombining = false;
         } else if (isLatinLetter(c)) {
             result.hasOtherContent = true;
+            result.hasLatin = true;
             latinCombining = true;
         } else if ((c >= U'0' && c <= U'9') || (c >= 0xFF10 && c <= 0xFF19)) {
             result.hasOtherContent = true;
@@ -293,6 +297,54 @@ std::optional<CandidateText> validateCandidate(std::string_view text) {
         ++i;
     }
     return result;
+}
+
+/// Remove English from the start and the end of a line, keeping the rest.
+/// The English edge is the outermost run of Latin letters together with the
+/// ASCII spaces and punctuation around them, so "Hello, 你好!" gives "你好".
+/// An edge run without a Latin letter (a bare "!") is left alone. Digits,
+/// emoji and everything else are not English and end the run.
+std::string stripEnglishEdges(std::string_view text) {
+    std::vector<std::pair<size_t, uint32_t>> chars; // byte offset, code point
+    auto iter = text.begin();
+    while (iter != text.end()) {
+        uint32_t c = utf8::INVALID_CHAR;
+        const auto at = static_cast<size_t>(iter - text.begin());
+        iter = utf8::getNextChar(iter, text.end(), &c);
+        chars.emplace_back(at, c);
+    }
+    const auto isEdge = [](uint32_t c) {
+        return isLatinLetter(c) || (c >= 0x0300 && c <= 0x036F) ||
+               (c >= 0x20 && c <= 0x7E && !(c >= U'0' && c <= U'9'));
+    };
+    size_t first = 0;
+    while (first < chars.size() && isEdge(chars[first].second)) {
+        ++first;
+    }
+    bool latin = false;
+    for (size_t i = 0; i < first; ++i) {
+        latin = latin || isLatinLetter(chars[i].second);
+    }
+    if (!latin) {
+        first = 0;
+    }
+    size_t last = chars.size();
+    while (last > first && isEdge(chars[last - 1].second)) {
+        --last;
+    }
+    latin = false;
+    for (size_t i = last; i < chars.size(); ++i) {
+        latin = latin || isLatinLetter(chars[i].second);
+    }
+    if (!latin) {
+        last = chars.size();
+    }
+    if (first >= last) {
+        return {};
+    }
+    const auto begin = chars[first].first;
+    const auto end = last == chars.size() ? text.size() : chars[last].first;
+    return std::string(trim(text.substr(begin, end - begin)));
 }
 
 std::string normalizedKeys(std::string_view text) {
@@ -609,7 +661,8 @@ bool isPlainPinyin(std::string_view text) {
 
 SanitizedCandidates sanitizeDetailed(std::string_view content,
                                      std::string_view pinyin,
-                                     size_t maxCandidates) {
+                                     size_t maxCandidates,
+                                     EnglishPolicy englishPolicy) {
     SanitizedCandidates result;
     if (content.size() > MAX_RESPONSE_BYTES) {
         reject(result, content, "response_too_large");
@@ -645,7 +698,7 @@ SanitizedCandidates sanitizeDetailed(std::string_view content,
         if (raw.find_first_not_of(' ') == std::string_view::npos) {
             continue;
         }
-        const auto text = validateCandidate(raw);
+        auto text = validateCandidate(raw);
         if (!text) {
             reject(result, raw, "invalid_text");
             continue;
@@ -654,12 +707,34 @@ SanitizedCandidates sanitizeDetailed(std::string_view content,
             reject(result, raw, "empty_or_punctuation");
             continue;
         }
+        // The user may keep the model to Chinese. Digits, punctuation and
+        // emoji are not English and stay acceptable.
+        std::string_view work = raw;
+        std::string strippedStorage;
+        bool strippedEnglish = false;
+        if (text->hasLatin && englishPolicy == EnglishPolicy::Discard) {
+            reject(result, raw, "english_disabled");
+            continue;
+        }
+        if (text->hasLatin && englishPolicy == EnglishPolicy::StripEdges) {
+            // Unwrap quotes/emphasis first so they do not shield the edges.
+            strippedStorage = stripEnglishEdges(stripWrappers(trim(raw)));
+            const auto stripped = validateCandidate(strippedStorage);
+            if (!stripped || (stripped->hanCount == 0 &&
+                              !stripped->hasOtherContent)) {
+                reject(result, raw, "english_disabled");
+                continue;
+            }
+            work = strippedStorage;
+            text = stripped;
+            strippedEnglish = true;
+        }
 
         // Preserve English/mixed/emoji punctuation (C++, C#, hello!, *️⃣) and
         // all emoji sequence bytes. Legacy bare-Han results still shed the
         // model's quotes/full stops before their exact syllable check.
         auto line =
-            text->hasOtherContent ? stripWrappers(raw) : stripNoise(raw);
+            text->hasOtherContent ? stripWrappers(work) : stripNoise(work);
         while (!line.empty() && line.front() == ' ') {
             line.remove_prefix(1);
         }
@@ -688,7 +763,9 @@ SanitizedCandidates sanitizeDetailed(std::string_view content,
             reject(result, raw, "too_long");
             continue;
         }
-        if (!text->hasOtherContent) {
+        // A line that lost its English also lost the keys that spelled it, so
+        // the syllable count of the full pinyin no longer applies.
+        if (!text->hasOtherContent && !strippedEnglish) {
             const auto hanCount = countHan(line);
             if (!hanCount) {
                 reject(result, raw, "invalid_text");
@@ -732,8 +809,10 @@ SanitizedCandidates sanitizeDetailed(std::string_view content,
 
 std::vector<std::string> sanitize(std::string_view content,
                                   std::string_view pinyin,
-                                  size_t maxCandidates) {
-    return sanitizeDetailed(content, pinyin, maxCandidates).candidates;
+                                  size_t maxCandidates,
+                                  EnglishPolicy englishPolicy) {
+    return sanitizeDetailed(content, pinyin, maxCandidates, englishPolicy)
+        .candidates;
 }
 
 BadgeSymbolError checkBadgeSymbol(std::string_view symbol) {
